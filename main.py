@@ -3,11 +3,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import html
 import json
 import os
 import re
 import sqlite3
 import time
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -25,12 +28,25 @@ from textual.widgets import Button, DataTable, Footer, Header, Input, RichLog, S
 SECTION_HEADER_RE = re.compile(r"^(?P<header>[A-Za-z0-9][A-Za-z0-9 /&()'_-]*):\s*$")
 INLINE_FIELD_RE = re.compile(r"^(?P<key>[A-Za-z0-9][A-Za-z0-9 /&()'_-]*):\s*(?P<value>.+)$")
 URL_RE = re.compile(r"https?://[^\s)]+")
+CITATION_MARKER_RE = re.compile(r"\[S\d+\]")
 
 # Load environment variables from .env automatically if present.
 load_dotenv()
 
 STAGES = ["Ingest", "Research", "Outline", "Draft", "Critique", "Revise", "Final"]
 REQUIRED_APPROVAL_STAGES = {"Ingest", "Final"}
+MESSAGE_TYPES = {"task", "question", "result", "review", "decision", "status"}
+PRIORITY_LEVELS = {"low", "normal", "high"}
+TASK_RELATED_MESSAGE_TYPES = {"task", "result", "review"}
+RUBRIC_DIMENSIONS = [
+    "factual_accuracy",
+    "evidence_quality",
+    "structure_and_coherence",
+    "clarity_and_readability",
+    "tone_and_audience_fit",
+    "originality_and_insight",
+]
+PUBLISHED_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}([T\s].*)?$")
 
 STAGE_OUTPUT_ARTIFACT = {
     "Ingest": "normalized_task_package",
@@ -73,6 +89,7 @@ CREATE TABLE IF NOT EXISTS messages (
     timestamp TEXT NOT NULL,
     content TEXT NOT NULL,
     task_id TEXT,
+    reply_to TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
 );
 
@@ -124,6 +141,111 @@ def infer_source_tier(source_ref: str) -> int:
     return 2
 
 
+def _clean_text(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    return cleaned
+
+
+def _extract_html_text(raw_html: str) -> tuple[str, str, str]:
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", raw_html, flags=re.IGNORECASE | re.DOTALL)
+    title = html.unescape(_clean_text(title_match.group(1))) if title_match else ""
+
+    published_match = re.search(
+        r"""<meta[^>]+(?:property|name)=["'](?:article:published_time|publishdate|datePublished|pubdate)["'][^>]+content=["']([^"']+)["']""",
+        raw_html,
+        flags=re.IGNORECASE,
+    )
+    published_at = _clean_text(published_match.group(1)) if published_match else ""
+
+    no_scripts = re.sub(r"<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>", " ", raw_html, flags=re.IGNORECASE)
+    no_styles = re.sub(r"<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>", " ", no_scripts, flags=re.IGNORECASE)
+    no_tags = re.sub(r"<[^>]+>", " ", no_styles)
+    text = html.unescape(_clean_text(no_tags))
+    return title, published_at, text
+
+
+def fetch_source_material(source_ref: str, *, timeout_s: float = 8.0) -> dict[str, str]:
+    retrieved_at = now_iso()
+    url = maybe_url(source_ref)
+    if not url:
+        return {
+            "source_ref": source_ref,
+            "url": "",
+            "title": _clean_text(source_ref)[:120],
+            "publisher": "",
+            "published_at": "",
+            "retrieved_at": retrieved_at,
+            "source_material": _clean_text(source_ref)[:4000],
+            "fetch_status": "inline_text",
+        }
+
+    parsed = urlparse(url)
+    publisher = parsed.netloc.lower()
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (compatible; AgenticTasksResearch/0.1; +https://example.local)"
+                )
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as response:
+            raw_bytes = response.read(250_000)
+            content_type = response.headers.get("Content-Type", "").lower()
+        text = raw_bytes.decode("utf-8", errors="replace")
+
+        title = ""
+        published_at = ""
+        if "html" in content_type or "<html" in text[:500].lower():
+            title, published_at, extracted = _extract_html_text(text)
+        else:
+            extracted = _clean_text(text)
+
+        if not extracted:
+            extracted = _clean_text(source_ref)
+
+        return {
+            "source_ref": source_ref,
+            "url": url,
+            "title": title[:160] if title else _clean_text(source_ref)[:120],
+            "publisher": publisher,
+            "published_at": published_at[:50],
+            "retrieved_at": retrieved_at,
+            "source_material": extracted[:8000],
+            "fetch_status": "fetched",
+        }
+    except (TimeoutError, urllib.error.URLError, ValueError):
+        return {
+            "source_ref": source_ref,
+            "url": url,
+            "title": _clean_text(source_ref)[:120],
+            "publisher": publisher,
+            "published_at": "",
+            "retrieved_at": retrieved_at,
+            "source_material": _clean_text(source_ref)[:4000],
+            "fetch_status": "fetch_failed",
+        }
+
+
+def extract_citation_markers(text: str) -> list[str]:
+    return CITATION_MARKER_RE.findall(text or "")
+
+
+def build_source_index(evidence_pack: dict[str, object]) -> dict[str, dict[str, object]]:
+    sources = evidence_pack.get("sources", [])
+    if not isinstance(sources, list):
+        return {}
+    index: dict[str, dict[str, object]] = {}
+    for item in sources:
+        if not isinstance(item, dict):
+            continue
+        source_id = str(item.get("source_id", "")).strip()
+        if source_id:
+            index[source_id] = item
+    return index
+
+
 @dataclass
 class NormalizedTaskPackage:
     run_id: str
@@ -167,6 +289,7 @@ class ChatMessage:
     timestamp: str
     content: str
     task_id: str | None = None
+    reply_to: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -183,6 +306,7 @@ class ChatMessage:
             timestamp=str(row["timestamp"]),
             content=str(row["content"]),
             task_id=(str(row["task_id"]) if row["task_id"] else None),
+            reply_to=(str(row["reply_to"]) if row["reply_to"] else None),
         )
 
 
@@ -278,8 +402,9 @@ class ResearchEngine:
                             "Constraints: {constraints}\n"
                             "Task objective: {task_objective}\n"
                             "Task instructions: {task_instructions}\n"
-                            "Source candidate: {source}\n"
-                            "Task: extract one evidence-backed claim from this source candidate."
+                            "Source reference: {source_ref}\n"
+                            "Source material excerpt: {source_material}\n"
+                            "Task: extract one evidence-backed claim from this source material."
                         ),
                     ),
                 ]
@@ -329,7 +454,8 @@ class ResearchEngine:
     def analyze_source(
         self,
         *,
-        source: str,
+        source_ref: str,
+        source_material: str,
         objective: str,
         audience: str,
         tone: str,
@@ -339,7 +465,7 @@ class ResearchEngine:
     ) -> dict[str, Any]:
         if not self.enabled or self._chain is None:
             return {
-                "claim": f"Potentially relevant source candidate: {source[:140]}",
+                "claim": f"Potentially relevant source candidate: {source_ref[:140]}",
                 "evidence_note": "Fallback mode (no model configured).",
                 "confidence": 0.35,
                 "risk_flags": ["model_unavailable"],
@@ -354,7 +480,8 @@ class ResearchEngine:
                     "constraints": "; ".join(constraints),
                     "task_objective": task_objective,
                     "task_instructions": task_instructions,
-                    "source": source,
+                    "source_ref": source_ref,
+                    "source_material": source_material[:6000],
                 }
             )
             parsed = self._parse_llm_json(raw)
@@ -366,7 +493,7 @@ class ResearchEngine:
             }
         except Exception:  # noqa: BLE001
             return {
-                "claim": f"Potentially relevant source candidate: {source[:140]}",
+                "claim": f"Potentially relevant source candidate: {source_ref[:140]}",
                 "evidence_note": "Fallback mode (research inference call failed).",
                 "confidence": 0.3,
                 "risk_flags": ["model_call_failed"],
@@ -404,6 +531,380 @@ class ResearchEngine:
             return {"decision": decision, "message": message}
         except Exception:
             return {"decision": "clear", "message": "Instructions look clear; I can proceed."}
+
+
+class WritingEngine:
+    def __init__(self) -> None:
+        self.enabled = False
+        self._outline_chain = None
+        self._draft_chain = None
+        self._revise_chain = None
+        self._init_error: str | None = None
+
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        model = os.getenv("WRITING_MODEL", os.getenv("RESEARCH_MODEL", "gpt-4o-mini")).strip()
+        if not api_key:
+            self._init_error = "OPENAI_API_KEY not set"
+            return
+
+        try:
+            from langchain_core.output_parsers import StrOutputParser
+            from langchain_core.prompts import ChatPromptTemplate
+            from langchain_openai import ChatOpenAI
+
+            outline_prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        (
+                            "You are a writing planner. Return ONLY compact JSON with keys: "
+                            "hook (string), sections (array of strings), argument_flow (array of strings), "
+                            "evidence_map (array of objects with keys: section, source_ids)."
+                        ),
+                    ),
+                    (
+                        "human",
+                        (
+                            "Objective: {objective}\nAudience: {audience}\nTone: {tone}\n"
+                            "Evidence claims JSON: {claims_json}\n"
+                            "Create a concise outline mapped to evidence source ids."
+                        ),
+                    ),
+                ]
+            )
+            draft_prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        (
+                            "You are a professional LinkedIn writer. Produce one polished draft in plain text. "
+                            "Cite factual claims inline using markers like [S1], [S2]."
+                        ),
+                    ),
+                    (
+                        "human",
+                        (
+                            "Objective: {objective}\nAudience: {audience}\nTone: {tone}\nConstraints: {constraints}\n"
+                            "Outline JSON: {outline_json}\nEvidence claims JSON: {claims_json}\n"
+                            "Write the draft with clear sections and citation markers."
+                        ),
+                    ),
+                ]
+            )
+            revise_prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        (
+                            "You are a revision writer. Return ONLY compact JSON with keys: revised_draft, changelog. "
+                            "changelog must be an array of short strings. Keep citation markers."
+                        ),
+                    ),
+                    (
+                        "human",
+                        (
+                            "Objective: {objective}\nAudience: {audience}\nTone: {tone}\nConstraints: {constraints}\n"
+                            "Current draft:\n{draft}\n"
+                            "Critique JSON: {critique_json}\n"
+                            "Evidence claims JSON: {claims_json}\n"
+                            "Revise the draft to address critique while preserving factual grounding and citations."
+                        ),
+                    ),
+                ]
+            )
+            llm = ChatOpenAI(model=model, temperature=0.2)
+            self._outline_chain = outline_prompt | llm | StrOutputParser()
+            self._draft_chain = draft_prompt | llm | StrOutputParser()
+            self._revise_chain = revise_prompt | llm | StrOutputParser()
+            self.enabled = True
+        except Exception as exc:  # noqa: BLE001
+            self._init_error = str(exc)
+
+    @property
+    def init_error(self) -> str | None:
+        return self._init_error
+
+    @staticmethod
+    def _parse_llm_json(raw: str) -> dict[str, Any]:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+            raise
+
+    @staticmethod
+    def _fallback_outline(claims: list[dict[str, object]]) -> dict[str, object]:
+        sections = ["Hook", "Context", "Evidence", "Implications", "Takeaway"]
+        source_ids = [str(c.get("source_id", "")) for c in claims[:5] if str(c.get("source_id", ""))]
+        return {
+            "hook": "Why this topic matters now.",
+            "sections": sections,
+            "argument_flow": sections,
+            "evidence_map": [{"section": "Evidence", "source_ids": source_ids}],
+        }
+
+    @staticmethod
+    def _fallback_draft(objective: str, claims: list[dict[str, object]]) -> str:
+        lines = [
+            f"{objective}",
+            "",
+            "Evidence highlights:",
+        ]
+        for claim in claims[:4]:
+            marker = str(claim.get("source_id", "S1"))
+            text = str(claim.get("claim", ""))
+            lines.append(f"- {text} [{marker}]")
+        lines.append("")
+        lines.append("Takeaway: Practical, evidence-backed action is possible with trade-offs.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _fallback_revision(draft: str) -> dict[str, object]:
+        revised = draft.strip()
+        if revised and not revised.endswith("\n"):
+            revised = f"{revised}\n"
+        revised += "\nRevision note: tightened structure and clarified evidence framing."
+        return {
+            "revised_draft": revised,
+            "changelog": ["Tightened structure.", "Clarified evidence framing."],
+        }
+
+    def create_outline(
+        self,
+        *,
+        objective: str,
+        audience: str,
+        tone: str,
+        claims: list[dict[str, object]],
+    ) -> dict[str, object]:
+        if not self.enabled or self._outline_chain is None:
+            return self._fallback_outline(claims)
+        try:
+            raw = self._outline_chain.invoke(
+                {
+                    "objective": objective,
+                    "audience": audience,
+                    "tone": tone,
+                    "claims_json": json.dumps(claims, ensure_ascii=True),
+                }
+            )
+            parsed = self._parse_llm_json(raw)
+            return {
+                "hook": str(parsed.get("hook", "Why this topic matters now.")),
+                "sections": [str(x) for x in parsed.get("sections", [])],
+                "argument_flow": [str(x) for x in parsed.get("argument_flow", [])],
+                "evidence_map": parsed.get("evidence_map", []),
+            }
+        except Exception:
+            return self._fallback_outline(claims)
+
+    def create_draft(
+        self,
+        *,
+        objective: str,
+        audience: str,
+        tone: str,
+        constraints: list[str],
+        outline: dict[str, object],
+        claims: list[dict[str, object]],
+    ) -> str:
+        if not self.enabled or self._draft_chain is None:
+            return self._fallback_draft(objective, claims)
+        try:
+            return str(
+                self._draft_chain.invoke(
+                    {
+                        "objective": objective,
+                        "audience": audience,
+                        "tone": tone,
+                        "constraints": "; ".join(constraints),
+                        "outline_json": json.dumps(outline, ensure_ascii=True),
+                        "claims_json": json.dumps(claims, ensure_ascii=True),
+                    }
+                )
+            ).strip()
+        except Exception:
+            return self._fallback_draft(objective, claims)
+
+    def revise_draft(
+        self,
+        *,
+        objective: str,
+        audience: str,
+        tone: str,
+        constraints: list[str],
+        draft: str,
+        critique: dict[str, object],
+        claims: list[dict[str, object]],
+    ) -> dict[str, object]:
+        if not self.enabled or self._revise_chain is None:
+            return self._fallback_revision(draft)
+        try:
+            raw = self._revise_chain.invoke(
+                {
+                    "objective": objective,
+                    "audience": audience,
+                    "tone": tone,
+                    "constraints": "; ".join(constraints),
+                    "draft": draft,
+                    "critique_json": json.dumps(critique, ensure_ascii=True),
+                    "claims_json": json.dumps(claims, ensure_ascii=True),
+                }
+            )
+            parsed = self._parse_llm_json(raw)
+            return {
+                "revised_draft": str(parsed.get("revised_draft", draft)).strip(),
+                "changelog": [str(x) for x in parsed.get("changelog", [])],
+            }
+        except Exception:
+            return self._fallback_revision(draft)
+
+
+class ReviewEngine:
+    def __init__(self) -> None:
+        self.enabled = False
+        self._chain = None
+        self._init_error: str | None = None
+
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        model = os.getenv("REVIEW_MODEL", os.getenv("RESEARCH_MODEL", "gpt-4o-mini")).strip()
+        if not api_key:
+            self._init_error = "OPENAI_API_KEY not set"
+            return
+
+        try:
+            from langchain_core.output_parsers import StrOutputParser
+            from langchain_core.prompts import ChatPromptTemplate
+            from langchain_openai import ChatOpenAI
+
+            prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        (
+                            "You are a strict editorial reviewer. Return ONLY compact JSON with keys: "
+                            "scores (object with keys factual_accuracy,evidence_quality,structure_and_coherence,"
+                            "clarity_and_readability,tone_and_audience_fit,originality_and_insight; each 0-5 int), "
+                            "issues (array of strings), revision_tasks (array of strings), "
+                            "hard_gates (object with keys factual_accuracy_min,evidence_quality_min,no_fabricated_citations; booleans)."
+                        ),
+                    ),
+                    (
+                        "human",
+                        (
+                            "Objective: {objective}\nAudience: {audience}\nTone: {tone}\n"
+                            "Source ids available: {source_ids}\n"
+                            "Draft:\n{draft}\n"
+                            "Evaluate using the rubric and hard gates."
+                        ),
+                    ),
+                ]
+            )
+            llm = ChatOpenAI(model=model, temperature=0)
+            self._chain = prompt | llm | StrOutputParser()
+            self.enabled = True
+        except Exception as exc:  # noqa: BLE001
+            self._init_error = str(exc)
+
+    @property
+    def init_error(self) -> str | None:
+        return self._init_error
+
+    @staticmethod
+    def _parse_llm_json(raw: str) -> dict[str, Any]:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+            raise
+
+    def evaluate_draft(
+        self,
+        *,
+        objective: str,
+        audience: str,
+        tone: str,
+        draft: str,
+        source_ids: list[str],
+    ) -> dict[str, object]:
+        markers = extract_citation_markers(draft)
+        marker_ids = sorted(set(markers))
+        unresolved = [marker for marker in marker_ids if marker.strip("[]") not in set(source_ids)]
+
+        if not self.enabled or self._chain is None:
+            facts = 4 if marker_ids else 2
+            evidence = 4 if marker_ids and not unresolved else 2
+            scores = {
+                "factual_accuracy": facts,
+                "evidence_quality": evidence,
+                "structure_and_coherence": 3,
+                "clarity_and_readability": 3,
+                "tone_and_audience_fit": 3,
+                "originality_and_insight": 3,
+            }
+            return self._finalize_review(scores=scores, issues=[], revision_tasks=[], unresolved_markers=unresolved)
+
+        try:
+            raw = self._chain.invoke(
+                {
+                    "objective": objective,
+                    "audience": audience,
+                    "tone": tone,
+                    "source_ids": ", ".join(source_ids),
+                    "draft": draft,
+                }
+            )
+            parsed = self._parse_llm_json(raw)
+            scores_raw = parsed.get("scores", {})
+            scores = {dim: int(scores_raw.get(dim, 0)) for dim in RUBRIC_DIMENSIONS}
+            issues = [str(x) for x in parsed.get("issues", [])]
+            tasks = [str(x) for x in parsed.get("revision_tasks", [])]
+            return self._finalize_review(scores=scores, issues=issues, revision_tasks=tasks, unresolved_markers=unresolved)
+        except Exception:
+            facts = 4 if marker_ids else 2
+            evidence = 4 if marker_ids and not unresolved else 2
+            scores = {
+                "factual_accuracy": facts,
+                "evidence_quality": evidence,
+                "structure_and_coherence": 3,
+                "clarity_and_readability": 3,
+                "tone_and_audience_fit": 3,
+                "originality_and_insight": 3,
+            }
+            return self._finalize_review(scores=scores, issues=[], revision_tasks=[], unresolved_markers=unresolved)
+
+    @staticmethod
+    def _finalize_review(
+        *,
+        scores: dict[str, int],
+        issues: list[str],
+        revision_tasks: list[str],
+        unresolved_markers: list[str],
+    ) -> dict[str, object]:
+        normalized_scores = {dim: max(0, min(5, int(scores.get(dim, 0)))) for dim in RUBRIC_DIMENSIONS}
+        total = sum(normalized_scores.values())
+        hard_gates = {
+            "factual_accuracy_min": normalized_scores["factual_accuracy"] >= 4,
+            "evidence_quality_min": normalized_scores["evidence_quality"] >= 4,
+            "no_fabricated_citations": len(unresolved_markers) == 0,
+        }
+        passed = total >= 24 and all(hard_gates.values())
+        all_issues = list(issues)
+        if unresolved_markers:
+            all_issues.append(f"Unresolved citation markers: {', '.join(unresolved_markers)}")
+        return {
+            "scores": normalized_scores,
+            "total_score": total,
+            "hard_gates": hard_gates,
+            "pass": passed,
+            "issues": all_issues,
+            "revision_tasks": revision_tasks,
+            "unresolved_citation_markers": unresolved_markers,
+        }
 
 
 class CoordinatorEngine:
@@ -747,6 +1248,12 @@ class RunRepository:
 
     def init_schema(self) -> None:
         self.conn.executescript(SCHEMA_SQL)
+        columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        if "reply_to" not in columns:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN reply_to TEXT")
         self.conn.commit()
 
     def close(self) -> None:
@@ -808,8 +1315,8 @@ class RunRepository:
     def add_message(self, run_id: str, message: ChatMessage) -> None:
         self.conn.execute(
             """
-            INSERT INTO messages (msg_id, run_id, from_agent, to_agent, message_type, stage, priority, timestamp, content, task_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO messages (msg_id, run_id, from_agent, to_agent, message_type, stage, priority, timestamp, content, task_id, reply_to)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 message.msg_id,
@@ -822,6 +1329,7 @@ class RunRepository:
                 message.timestamp,
                 message.content,
                 message.task_id,
+                message.reply_to,
             ),
         )
         self.conn.commit()
@@ -1034,6 +1542,8 @@ class AgenticTUI(App[None]):
         self.resume_run_id = resume_run_id
         self.coordinator_engine = CoordinatorEngine()
         self.research_engine = ResearchEngine()
+        self.writing_engine = WritingEngine()
+        self.review_engine = ReviewEngine()
         self.coordinator_plan: dict[str, Any] = {}
         self.task_briefs: dict[str, dict[str, str]] = {}
         self._spinner_idx = 0
@@ -1076,6 +1586,14 @@ class AgenticTUI(App[None]):
         if not self.research_engine.enabled and self.research_engine.init_error:
             self.query_one("#event-log", RichLog).write(
                 f"Research engine fallback mode: {self.research_engine.init_error}"
+            )
+        if not self.writing_engine.enabled and self.writing_engine.init_error:
+            self.query_one("#event-log", RichLog).write(
+                f"Writing engine fallback mode: {self.writing_engine.init_error}"
+            )
+        if not self.review_engine.enabled and self.review_engine.init_error:
+            self.query_one("#event-log", RichLog).write(
+                f"Review engine fallback mode: {self.review_engine.init_error}"
             )
         self.set_focus(self.query_one("#input-bar", Input))
         self._set_status("Initializing run and coordinator plan...", level="in_progress")
@@ -1430,6 +1948,12 @@ class AgenticTUI(App[None]):
         if stage == "Final" and not self.state.approvals.get("Final", False):
             self._log_event("Cannot start Final: Final approval is pending.")
             return False
+        if stage == "Final":
+            critique_payload = self.state.artifacts.get("critique_feedback", {})
+            critique = critique_payload if isinstance(critique_payload, dict) else {}
+            if not bool(critique.get("pass", False)):
+                self._log_event("Cannot start Final: critique hard gates are not passing.")
+                return False
 
         self.state.stage_status[stage] = "in_progress"
         self._persist_run_status()
@@ -1450,17 +1974,11 @@ class AgenticTUI(App[None]):
         if not self.state:
             return False
 
-        if message.to_agent == "broadcast" and message.message_type not in {"status", "decision"}:
-            self._log_event("Broadcast rejected: only status/decision allowed.")
+        errors = self._validate_chat_message(message)
+        if errors:
+            for error in errors:
+                self._log_event(f"Message rejected: {error}")
             return False
-
-        if message.message_type == "task":
-            if not message.task_id:
-                self._log_event("Task rejected: task_id is required.")
-                return False
-            if message.to_agent == "broadcast":
-                self._log_event("Task rejected: tasks cannot target broadcast.")
-                return False
 
         self.state.messages.append(message)
         if self.repo is not None:
@@ -1517,9 +2035,14 @@ class AgenticTUI(App[None]):
             "- `/help`: Show available commands.\n"
             "- `/plan`: Show the latest coordinator plan.\n"
             "- `/run`: Show run summary and approval/checkpoint state.\n"
+            "- `/sources`: Show current evidence sources.\n"
             "- `/agents`: List active agents and aggregate task status counts.\n"
+            "- `/inbox <agent_id>`: Show a filtered inbox from shared chat.\n"
             "- `/agent <agent_id>`: Show tasks and outputs for one agent.\n"
             "- `/task <task_id_or_prefix>`: Inspect one task output/error details.\n"
+            "- `/approve`: Approve current gate in chat.\n"
+            "- `/reject <reason>`: Reject/feedback current gate in chat.\n"
+            "- `/export [path]`: Export post + references to markdown file.\n"
             "- `/view compact|detailed`: Switch chat density.\n"
             "- `/scope focus|all`: Show only user/coordinator chat or all traffic.\n"
             "- `/internal on|off`: Show/hide internal status chatter.\n"
@@ -1563,6 +2086,86 @@ class AgenticTUI(App[None]):
             "\n**Approvals**\n"
             f"{approvals_block}"
         )
+
+    def _command_sources(self) -> str:
+        if not self.state:
+            return "No active run."
+        evidence = self.state.artifacts.get("evidence_pack", {})
+        if not isinstance(evidence, dict):
+            return "No evidence pack available yet."
+        sources = evidence.get("sources", [])
+        if not isinstance(sources, list) or not sources:
+            return "No evidence sources available yet."
+        lines = [
+            "## Evidence Sources",
+            "| Source ID | Title | Publisher | Tier | Confidence |",
+            "|---|---|---|---:|---:|",
+        ]
+        for source in sources[:30]:
+            if not isinstance(source, dict):
+                continue
+            source_id = str(source.get("source_id", ""))
+            title = str(source.get("title", "")).replace("|", " ")
+            publisher = str(source.get("publisher", "")).replace("|", " ")
+            tier = str(source.get("tier", ""))
+            confidence = str(source.get("confidence", ""))
+            lines.append(f"| `{source_id}` | {title} | {publisher} | {tier} | {confidence} |")
+        return "\n".join(lines)
+
+    def _export_markdown(self, output_path: Path) -> str:
+        if not self.state:
+            return "No active run."
+        final_payload = self.state.artifacts.get("final_post")
+        post_text = ""
+        references: list[dict[str, str]] = []
+        if isinstance(final_payload, dict):
+            post_text = str(final_payload.get("post_text", "")).strip()
+            raw_refs = final_payload.get("references", [])
+            if isinstance(raw_refs, list):
+                for item in raw_refs:
+                    if isinstance(item, dict):
+                        references.append(
+                            {
+                                "source_id": str(item.get("source_id", "")),
+                                "title": str(item.get("title", "")),
+                                "url": str(item.get("url", "")),
+                            }
+                        )
+        if not post_text:
+            revised = self.state.artifacts.get("revised_draft", {})
+            if isinstance(revised, dict):
+                post_text = str(revised.get("revised_draft", "")).strip()
+            if not post_text:
+                post_text = str(self.state.artifacts.get("first_draft", "")).strip()
+            evidence = self.state.artifacts.get("evidence_pack", {})
+            if isinstance(evidence, dict):
+                for source in evidence.get("sources", [])[:50] if isinstance(evidence.get("sources", []), list) else []:
+                    if isinstance(source, dict):
+                        references.append(
+                            {
+                                "source_id": str(source.get("source_id", "")),
+                                "title": str(source.get("title", "")),
+                                "url": str(source.get("url", "")),
+                            }
+                        )
+        if not post_text:
+            return "Nothing to export yet. Complete Draft/Revise first."
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        lines = ["# Post", "", post_text, "", "## References", ""]
+        if references:
+            for ref in references:
+                sid = ref.get("source_id", "")
+                title = ref.get("title", "")
+                url = ref.get("url", "")
+                if url:
+                    lines.append(f"- [{sid}] {title} - {url}")
+                else:
+                    lines.append(f"- [{sid}] {title}")
+        else:
+            lines.append("- (none)")
+        output_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+        return f"Exported markdown to `{output_path}`."
 
     def _build_runtime_context(self) -> dict[str, Any]:
         if not self.state:
@@ -1631,6 +2234,62 @@ class AgenticTUI(App[None]):
             lines.append("")
         return "\n".join(lines).strip()
 
+    def _command_inbox(self, agent_id: str) -> str:
+        if not self.state:
+            return "No active run."
+        inbox = [
+            message
+            for message in self.state.messages
+            if message.to_agent in {agent_id, "broadcast"}
+        ]
+        if not inbox:
+            return f"No inbox messages for `{agent_id}`."
+
+        lines = [f"## Inbox `{agent_id}`", f"- Messages: `{len(inbox)}`", ""]
+        for message in inbox[-25:]:
+            ts = message.timestamp.split("T")[1][:8] if "T" in message.timestamp else message.timestamp
+            task_hint = f" task={message.task_id[:8]}" if message.task_id else ""
+            preview = " ".join((message.content or "").split())
+            if len(preview) > 120:
+                preview = preview[:119].rstrip() + "…"
+            lines.append(
+                f"- `{ts}` `{message.message_type}` `{message.stage}` from `{message.from_agent}`{task_hint}: {preview}"
+            )
+        return "\n".join(lines)
+
+    def _validate_chat_message(self, message: ChatMessage) -> list[str]:
+        errors: list[str] = []
+        if not message.msg_id.strip():
+            errors.append("msg_id is required.")
+        if not message.from_agent.strip():
+            errors.append("from_agent is required.")
+        if not message.to_agent.strip():
+            errors.append("to_agent is required.")
+        if message.message_type not in MESSAGE_TYPES:
+            errors.append(f"message_type must be one of: {', '.join(sorted(MESSAGE_TYPES))}.")
+        if message.stage not in STAGES:
+            errors.append(f"stage must be one of: {', '.join(STAGES)}.")
+        if message.priority not in PRIORITY_LEVELS:
+            errors.append(f"priority must be one of: {', '.join(sorted(PRIORITY_LEVELS))}.")
+        if not message.timestamp.strip():
+            errors.append("timestamp is required.")
+        if not message.content.strip():
+            errors.append("content is required.")
+
+        if message.to_agent == "broadcast" and message.message_type not in {"status", "decision"}:
+            errors.append("broadcast supports only status/decision message types.")
+        if message.message_type in TASK_RELATED_MESSAGE_TYPES:
+            if not message.task_id:
+                errors.append(f"{message.message_type} requires task_id.")
+            if message.to_agent == "broadcast":
+                errors.append("task-related messages cannot target broadcast.")
+
+        if message.reply_to and self.state:
+            known_ids = {entry.msg_id for entry in self.state.messages}
+            if message.reply_to not in known_ids:
+                errors.append("reply_to does not reference a known message id.")
+        return errors
+
     def _command_task_details(self, task_key: str) -> str:
         if not self.state:
             return "No active run."
@@ -1666,7 +2325,7 @@ class AgenticTUI(App[None]):
             lines.append(self._format_json_block(task.output))
         return "\n".join(lines)
 
-    def _handle_slash_command(self, text: str) -> bool:
+    async def _handle_slash_command(self, text: str) -> bool:
         command, _, remainder = text.partition(" ")
         cmd = command.strip().lower()
         arg = remainder.strip()
@@ -1684,8 +2343,19 @@ class AgenticTUI(App[None]):
             self._post_coordinator_markdown(self._command_run_summary())
             return True
 
+        if cmd == "/sources":
+            self._post_coordinator_markdown(self._command_sources())
+            return True
+
         if cmd == "/agents":
             self._post_coordinator_markdown(self._command_agents_summary())
+            return True
+
+        if cmd == "/inbox":
+            if not arg:
+                self._post_coordinator_markdown("Usage: `/inbox <agent_id>`")
+                return True
+            self._post_coordinator_markdown(self._command_inbox(arg))
             return True
 
         if cmd == "/agent":
@@ -1741,6 +2411,48 @@ class AgenticTUI(App[None]):
             self._repaint_chat_log()
             state = "on" if self.show_progress_updates else "off"
             self._post_coordinator_markdown(f"Progress updates set to `{state}`.")
+            return True
+
+        if cmd == "/approve":
+            if self.state and not self.state.approvals.get("Ingest", False):
+                self._approve_ingest("Plan approved. Continue.", auto_advance=True)
+                await self.action_advance_stage()
+                return True
+            if self.state and self.state.stage_status.get("Revise") == "completed" and not self.state.approvals.get("Final", False):
+                self.action_approve_gate()
+                if self.state.approvals.get("Final", False):
+                    await self.action_advance_stage()
+                return True
+            self._post_coordinator_markdown("No pending approval gate.")
+            return True
+
+        if cmd == "/reject":
+            reason = arg.strip() or "Rejected by user. Please revise."
+            if self.state and not self.state.approvals.get("Ingest", False):
+                await self._iterate_ingest_with_feedback(reason)
+                return True
+            if self.state and self.state.stage_status.get("Revise") == "completed" and not self.state.approvals.get("Final", False):
+                self._post_chat_message(
+                    ChatMessage(
+                        msg_id=str(uuid.uuid4()),
+                        from_agent="user",
+                        to_agent="coordinator",
+                        message_type="decision",
+                        stage="Final",
+                        priority="high",
+                        timestamp=now_iso(),
+                        content=f"Final approval rejected: {reason}",
+                    )
+                )
+                self._post_coordinator_markdown("Understood. I will keep iterating before finalization.")
+                return True
+            self._post_coordinator_markdown("No pending approval gate to reject.")
+            return True
+
+        if cmd == "/export":
+            path_arg = arg or f"exports/final-{(self.state.run_id[:8] if self.state else 'run')}.md"
+            output = self._export_markdown(Path(path_arg))
+            self._post_coordinator_markdown(output)
             return True
 
         self._post_coordinator_markdown(
@@ -1982,8 +2694,10 @@ class AgenticTUI(App[None]):
         brief = self.task_briefs.get(task.task_id, {})
         task_objective = brief.get("objective", "Extract one evidence-backed claim.")
         task_instructions = brief.get("instructions", "Provide claim with confidence and caveats.")
+        source_payload = fetch_source_material(task.input_ref)
         analysis = self.research_engine.analyze_source(
-            source=task.input_ref,
+            source_ref=str(source_payload.get("source_ref", task.input_ref)),
+            source_material=str(source_payload.get("source_material", task.input_ref)),
             objective=objective,
             audience=audience,
             tone=tone,
@@ -1993,6 +2707,12 @@ class AgenticTUI(App[None]):
         )
         return {
             "source_ref": task.input_ref,
+            "source_url": str(source_payload.get("url", "")),
+            "source_title": str(source_payload.get("title", "")),
+            "source_publisher": str(source_payload.get("publisher", "")),
+            "source_published_at": str(source_payload.get("published_at", "")),
+            "source_retrieved_at": str(source_payload.get("retrieved_at", now_iso())),
+            "fetch_status": str(source_payload.get("fetch_status", "unknown")),
             "claim": analysis["claim"],
             "evidence_note": analysis["evidence_note"],
             "confidence": float(analysis["confidence"]),
@@ -2114,7 +2834,6 @@ class AgenticTUI(App[None]):
         for task, result, err in results:
             if err is None and result is not None:
                 self._set_task_status(task, status="done", output=result)
-                claims.append(result)
                 self._log_event(f"Research subtask done: {task.task_id[:8]} by {task.owner}")
                 self._post_chat_message(
                     ChatMessage(
@@ -2130,20 +2849,35 @@ class AgenticTUI(App[None]):
                     )
                 )
                 source_ref = str(result.get("source_ref", task.input_ref))
-                url = maybe_url(source_ref)
+                url = str(result.get("source_url", "")) or (maybe_url(source_ref) or "")
+                title = str(result.get("source_title", "")) or source_ref[:120]
+                publisher = str(result.get("source_publisher", ""))
+                published_at = str(result.get("source_published_at", ""))
+                retrieved_at = str(result.get("source_retrieved_at", now_iso()))
                 source_id = f"S{source_id_counter}"
                 source_id_counter += 1
                 source_entries.append(
                     {
                         "source_id": source_id,
-                        "title": source_ref[:120],
-                        "url": url or "",
-                        "publisher": "",
-                        "published_at": "",
-                        "retrieved_at": now_iso(),
+                        "title": title,
+                        "url": url,
+                        "publisher": publisher,
+                        "published_at": published_at,
+                        "retrieved_at": retrieved_at,
                         "tier": infer_source_tier(source_ref),
                         "confidence": float(result.get("confidence", 0.5)),
                         "key_claims": [str(result.get("claim", ""))],
+                        "fetch_status": str(result.get("fetch_status", "unknown")),
+                    }
+                )
+                claims.append(
+                    {
+                        "source_id": source_id,
+                        "source_ref": source_ref,
+                        "claim": str(result.get("claim", "")),
+                        "evidence_note": str(result.get("evidence_note", "")),
+                        "confidence": float(result.get("confidence", 0.5)),
+                        "risk_flags": [str(x) for x in result.get("risk_flags", [])],
                     }
                 )
             else:
@@ -2171,6 +2905,212 @@ class AgenticTUI(App[None]):
             "claims": claims,
         }
 
+    def _evidence_pack(self) -> dict[str, object]:
+        if not self.state:
+            return {"sources": [], "claims": []}
+        payload = self.state.artifacts.get("evidence_pack", {})
+        return payload if isinstance(payload, dict) else {"sources": [], "claims": []}
+
+    def _outline_stage_output(self) -> dict[str, object]:
+        evidence = self._evidence_pack()
+        claims = evidence.get("claims", [])
+        claims_list = claims if isinstance(claims, list) else []
+        objective = self.package.objective if self.package else ""
+        audience = self.package.audience if self.package else ""
+        tone = self.package.tone if self.package else ""
+        return self.writing_engine.create_outline(
+            objective=objective,
+            audience=audience,
+            tone=tone,
+            claims=[c for c in claims_list if isinstance(c, dict)],
+        )
+
+    def _draft_stage_output(self) -> str:
+        evidence = self._evidence_pack()
+        claims = evidence.get("claims", [])
+        claims_list = [c for c in claims if isinstance(c, dict)] if isinstance(claims, list) else []
+        outline = self.state.artifacts.get("approved_outline", {}) if self.state else {}
+        outline_payload = outline if isinstance(outline, dict) else {}
+        objective = self.package.objective if self.package else ""
+        audience = self.package.audience if self.package else ""
+        tone = self.package.tone if self.package else ""
+        constraints = self.package.constraints if self.package else []
+        return self.writing_engine.create_draft(
+            objective=objective,
+            audience=audience,
+            tone=tone,
+            constraints=constraints,
+            outline=outline_payload,
+            claims=claims_list,
+        )
+
+    def _critique_for_draft(self, draft_text: str) -> dict[str, object]:
+        evidence = self._evidence_pack()
+        source_index = build_source_index(evidence)
+        source_ids = sorted(source_index.keys())
+        objective = self.package.objective if self.package else ""
+        audience = self.package.audience if self.package else ""
+        tone = self.package.tone if self.package else ""
+        review = self.review_engine.evaluate_draft(
+            objective=objective,
+            audience=audience,
+            tone=tone,
+            draft=draft_text,
+            source_ids=source_ids,
+        )
+        citation_validation = self._validate_citation_integrity(draft_text, evidence)
+        review["citation_validation"] = citation_validation
+        if not bool(citation_validation.get("pass", False)):
+            hard_gates = review.get("hard_gates", {})
+            if not isinstance(hard_gates, dict):
+                hard_gates = {}
+            hard_gates["no_fabricated_citations"] = False
+            review["hard_gates"] = hard_gates
+            issues = review.get("issues", [])
+            if not isinstance(issues, list):
+                issues = []
+            for err in citation_validation.get("errors", []):
+                issues.append(str(err))
+            review["issues"] = issues
+            total = int(review.get("total_score", 0))
+            review["pass"] = bool(total >= 24 and all(bool(v) for v in hard_gates.values()))
+        return review
+
+    def _validate_citation_integrity(self, draft_text: str, evidence_pack: dict[str, object]) -> dict[str, object]:
+        source_index = build_source_index(evidence_pack)
+        markers = sorted(set(extract_citation_markers(draft_text)))
+        cited_source_ids = [marker.strip("[]") for marker in markers]
+        errors: list[str] = []
+
+        unresolved = [sid for sid in cited_source_ids if sid not in source_index]
+        if unresolved:
+            errors.append(f"Unresolved citation markers: {', '.join(unresolved)}")
+
+        known_urls = {
+            str(source.get("url", "")).strip()
+            for source in source_index.values()
+            if isinstance(source, dict) and str(source.get("url", "")).strip()
+        }
+        for url in URL_RE.findall(draft_text):
+            if url not in known_urls:
+                errors.append(f"Draft contains URL not present in evidence pack: {url}")
+
+        required_fields = ("title", "url", "retrieved_at")
+        for source_id in cited_source_ids:
+            source = source_index.get(source_id)
+            if not isinstance(source, dict):
+                continue
+            missing_fields = [field for field in required_fields if not str(source.get(field, "")).strip()]
+            if missing_fields:
+                errors.append(f"Source {source_id} missing required fields: {', '.join(missing_fields)}")
+            url = str(source.get("url", "")).strip()
+            if url and maybe_url(url) is None:
+                errors.append(f"Source {source_id} has invalid URL: {url}")
+            published_at = str(source.get("published_at", "")).strip()
+            if published_at and not PUBLISHED_DATE_RE.match(published_at):
+                errors.append(f"Source {source_id} has invalid published_at format: {published_at}")
+            title = str(source.get("title", "")).strip().lower()
+            if any(token in title for token in ("placeholder", "unknown", "n/a", "todo")):
+                errors.append(f"Source {source_id} title looks fabricated or placeholder-like.")
+
+        return {
+            "pass": len(errors) == 0,
+            "cited_source_ids": cited_source_ids,
+            "unresolved_source_ids": unresolved,
+            "errors": errors,
+        }
+
+    def _critique_stage_output(self) -> dict[str, object]:
+        draft_payload = self.state.artifacts.get("first_draft", "") if self.state else ""
+        draft_text = str(draft_payload)
+        return self._critique_for_draft(draft_text)
+
+    def _revise_stage_output(self) -> dict[str, object]:
+        if not self.state:
+            return {"revised_draft": "", "changelog": [], "passes_quality_gate": False}
+        draft_text = str(self.state.artifacts.get("first_draft", ""))
+        critique_payload = self.state.artifacts.get("critique_feedback", {})
+        critique = critique_payload if isinstance(critique_payload, dict) else {}
+        evidence = self._evidence_pack()
+        claims = evidence.get("claims", [])
+        claims_list = [c for c in claims if isinstance(c, dict)] if isinstance(claims, list) else []
+        objective = self.package.objective if self.package else ""
+        audience = self.package.audience if self.package else ""
+        tone = self.package.tone if self.package else ""
+        constraints = self.package.constraints if self.package else []
+
+        passes_gate = bool(critique.get("pass", False))
+        changelog: list[str] = []
+        revision_attempts = 0
+        max_rounds = max(1, int(os.getenv("MAX_REVISION_ROUNDS", "3")))
+        current_draft = draft_text
+        current_critique = critique
+
+        while not passes_gate and revision_attempts < max_rounds:
+            revision_attempts += 1
+            revised = self.writing_engine.revise_draft(
+                objective=objective,
+                audience=audience,
+                tone=tone,
+                constraints=constraints,
+                draft=current_draft,
+                critique=current_critique,
+                claims=claims_list,
+            )
+            current_draft = str(revised.get("revised_draft", current_draft))
+            for item in revised.get("changelog", []):
+                changelog.append(str(item))
+            current_critique = self._critique_for_draft(current_draft)
+            passes_gate = bool(current_critique.get("pass", False))
+
+        if not changelog:
+            changelog = ["No revision changes required; critique already passed."]
+
+        self._persist_artifact("critique_feedback", current_critique)
+        return {
+            "revised_draft": current_draft,
+            "changelog": changelog,
+            "revision_attempts": revision_attempts,
+            "passes_quality_gate": passes_gate,
+            "final_critique": current_critique,
+        }
+
+    def _final_stage_output(self) -> dict[str, object]:
+        if not self.state:
+            return {"post_text": "", "references": []}
+        revised_payload = self.state.artifacts.get("revised_draft", "")
+        draft_text = ""
+        if isinstance(revised_payload, dict):
+            draft_text = str(revised_payload.get("revised_draft", ""))
+        if not draft_text:
+            draft_text = str(self.state.artifacts.get("first_draft", ""))
+
+        evidence = self._evidence_pack()
+        citation_validation = self._validate_citation_integrity(draft_text, evidence)
+        if not bool(citation_validation.get("pass", False)):
+            errors = citation_validation.get("errors", [])
+            detail = "; ".join([str(err) for err in errors[:4]])
+            raise ValueError(f"Citation integrity check failed: {detail}")
+
+        source_index = build_source_index(evidence)
+        markers = sorted(set(extract_citation_markers(draft_text)))
+        references: list[dict[str, str]] = []
+        for marker in markers:
+            source_id = marker.strip("[]")
+            source = source_index.get(source_id, {})
+            references.append(
+                {
+                    "source_id": source_id,
+                    "title": str(source.get("title", "")),
+                    "url": str(source.get("url", "")),
+                }
+            )
+        return {
+            "post_text": draft_text,
+            "references": references,
+            "citation_validation": citation_validation,
+        }
+
     async def action_advance_stage(self) -> None:
         if not self.state:
             return
@@ -2184,23 +3124,68 @@ class AgenticTUI(App[None]):
             self._render_all()
             return
 
-        if next_stage == "Research":
-            output = await self._execute_research_parallel()
-        elif next_stage == "Outline":
-            output = {
-                "hook": "Placeholder hook",
-                "sections": ["Problem", "Evidence", "Risks", "Takeaway"],
-            }
-        elif next_stage == "Draft":
-            output = "Placeholder first draft with citation markers [S1][S2]."
-        elif next_stage == "Critique":
-            output = {"score": 24, "issues": ["Tighten opening", "Add one risk source"]}
-        elif next_stage == "Revise":
-            output = "Placeholder revised draft with changelog applied."
-        elif next_stage == "Final":
-            output = "Placeholder final post text + references."
-        else:
-            output = {"ok": True}
+        try:
+            if next_stage == "Research":
+                output = await self._execute_research_parallel()
+            elif next_stage == "Outline":
+                output = await asyncio.to_thread(self._outline_stage_output)
+            elif next_stage == "Draft":
+                output = await asyncio.to_thread(self._draft_stage_output)
+            elif next_stage == "Critique":
+                output = await asyncio.to_thread(self._critique_stage_output)
+            elif next_stage == "Revise":
+                output = await asyncio.to_thread(self._revise_stage_output)
+                if isinstance(output, dict) and not bool(output.get("passes_quality_gate", False)):
+                    self._post_chat_message(
+                        ChatMessage(
+                            msg_id=str(uuid.uuid4()),
+                            from_agent="coordinator",
+                            to_agent="user",
+                            message_type="status",
+                            stage="Revise",
+                            priority="high",
+                            timestamp=now_iso(),
+                            content=(
+                                "Revise completed but quality gate still failing after max rounds. "
+                                "Please adjust constraints/objective and retry."
+                            ),
+                        )
+                    )
+                else:
+                    self._post_chat_message(
+                        ChatMessage(
+                            msg_id=str(uuid.uuid4()),
+                            from_agent="coordinator",
+                            to_agent="user",
+                            message_type="question",
+                            stage="Final",
+                            priority="high",
+                            timestamp=now_iso(),
+                            content="Revision passed quality gates. Approve finalization when ready.",
+                        )
+                    )
+            elif next_stage == "Final":
+                output = await asyncio.to_thread(self._final_stage_output)
+            else:
+                output = {"ok": True}
+        except Exception as exc:  # noqa: BLE001
+            self.state.stage_status[next_stage] = "failed"
+            self._persist_run_status()
+            self._log_event(f"Stage failed: {next_stage} ({exc})")
+            self._post_chat_message(
+                ChatMessage(
+                    msg_id=str(uuid.uuid4()),
+                    from_agent="coordinator",
+                    to_agent="user",
+                    message_type="status",
+                    stage=next_stage,
+                    priority="high",
+                    timestamp=now_iso(),
+                    content=f"{next_stage} failed: {exc}",
+                )
+            )
+            self._render_all()
+            return
 
         self._complete_stage(next_stage, output)
         self._post_chat_message(
@@ -2278,7 +3263,7 @@ class AgenticTUI(App[None]):
             return
 
         if text.startswith("/"):
-            self._handle_slash_command(text)
+            await self._handle_slash_command(text)
             return
 
         if self.state and not self.state.approvals.get("Ingest", False):

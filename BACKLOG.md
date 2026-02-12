@@ -7,10 +7,17 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 - `P1`: important improvements that materially increase reliability and usability.
 - `P2`: optional enhancements after core validation.
 
+## Status legend
+- `Completed`: implemented and usable in current codebase.
+- `Partial`: implemented in part; still missing acceptance-criteria coverage.
+- `Open`: not yet implemented.
+
 ## P0
 
 ### BL-001 Ingest and normalize user brief
 - Priority: `P0`
+- Status: `Completed`
+- Notes: Brief parsing + required-field validation + normalized task package creation are in place.
 - Goal: convert raw user input and optional files into a normalized task package.
 - Scope:
   - Parse input text/file.
@@ -24,6 +31,8 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-002 Coordinator stage machine and ledger
 - Priority: `P0`
+- Status: `Completed`
+- Notes: 7-stage machine, transition checks, approvals, and persisted ledger are implemented.
 - Goal: execute the 7-stage pipeline with deterministic gating.
 - Scope:
   - Implement stage transitions and required-input checks.
@@ -38,6 +47,8 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-003 Shared chat protocol and routing
 - Priority: `P0`
+- Status: `Completed`
+- Notes: Message envelope validation is enforced (type/stage/priority/task_id/routing), `reply_to` is persisted, and `/inbox <agent_id>` derives filtered inbox from the shared log.
 - Goal: support team-like communication with deterministic task pickup.
 - Scope:
   - Validate message envelope fields.
@@ -52,6 +63,8 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-004 Persistence layer (SQLite)
 - Priority: `P0`
+- Status: `Completed`
+- Notes: SQLite schema/repository implemented for runs, artifacts, messages, events, and tasks with resume support.
 - Goal: persist all run-critical artifacts.
 - Scope:
   - SQLite schema and access layer for runs, messages, tasks, stage ledger, evidence pack, outputs.
@@ -65,6 +78,8 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-005 Worker queue and parallel task execution
 - Priority: `P0`
+- Status: `Completed`
+- Notes: Parallel research fan-out/fan-in is implemented via background worker execution and task lifecycle updates.
 - Goal: run independent tasks in parallel without losing coordinator control.
 - Scope:
   - Local queue for background tasks.
@@ -78,6 +93,8 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-006 Research stage and evidence pack generation
 - Priority: `P0`
+- Status: `Completed`
+- Notes: URL source fetch/extract pipeline is implemented (with fallback), evidence metadata is captured per source, and claims are mapped to `source_id`.
 - Goal: produce structured evidence from provided links/text.
 - Scope:
   - Source fetch/extract pipeline.
@@ -91,6 +108,8 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-007 Draft, critique, revise loop
 - Priority: `P0`
+- Status: `Completed`
+- Notes: Outline/draft generation, rubric-based critique with hard gates, and iterative revise rounds are implemented; `Final` is blocked unless critique passes.
 - Goal: generate a draft, review it with rubric, and revise until pass or escalation.
 - Scope:
   - Outline creation.
@@ -106,6 +125,8 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-008 Citation integrity and anti-fabrication guardrails
 - Priority: `P0`
+- Status: `Completed`
+- Notes: Finalization now enforces citation integrity (marker resolution, required source fields, URL/date sanity, and unmapped-link rejection) and fails gracefully on violations.
 - Goal: prevent unsupported or invented citations.
 - Scope:
   - Marker-to-source validation (`[Sx]` must resolve).
@@ -119,25 +140,71 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-009 Console UX (core commands)
 - Priority: `P0`
-- Goal: operate the full system from terminal.
+- Status: `Completed`
+- Notes: End-to-end run control is now TUI-native via chat commands (including approvals, source inspection, and export) with no mandatory external CLI steps.
+- Goal: operate the full system through an interactive TUI as the primary control surface.
 - Scope:
-  - `run <input_path>`
-  - `status <run_id>`
-  - `show-chat <run_id> [--agent <agent_id>]`
-  - `show-sources <run_id>`
-  - `approve <run_id> <checkpoint>`
-  - `reject <run_id> <checkpoint> --reason "..."`
-  - `export <run_id> --out <path>`
+  - Chat-first operation for run control and stage progression.
+  - In-TUI approvals/rejections and coordinator feedback loop.
+  - In-TUI inspection of plan, run state, agents, inboxes, tasks, and evidence references.
+  - TUI commands as convenience (e.g., slash commands), not mandatory shell commands.
+  - Export final post + references from the TUI flow.
 - Acceptance criteria:
-  - User can complete one end-to-end run via CLI only.
-  - Mandatory approvals pause progression until explicit action.
+  - User can complete one end-to-end run using only the TUI.
+  - No mandatory external CLI commands are required during normal operation.
+  - Mandatory approvals pause progression until explicit user action.
 - Dependencies: BL-002, BL-003, BL-004, BL-007
 - Guided by decisions: D4, D7
+
+### BL-018 Modularize the application architecture
+- Priority: `P0`
+- Status: `Open`
+- Notes:
+  - Quick debt snapshot:
+    - `main.py` is currently ~3347 lines.
+    - Core concerns are tightly coupled in one file (TUI, orchestration, storage, engines, parsing, validation, export).
+    - High-complexity control paths exist in single methods (notably slash command handling and stage advancement).
+- Goal: split the single-file implementation into maintainable modules without changing behavior.
+- Scope:
+  - Create module boundaries (for example: `ui/`, `engines/`, `domain/`, `storage/`, `services/`, `utils/`).
+  - Extract TUI view/rendering and command handling from orchestration logic.
+  - Extract stage execution logic into dedicated workflow/service modules.
+  - Keep stable public entrypoint (`main.py`) as a thin bootstrap.
+- Acceptance criteria:
+  - No single module exceeds 600 lines for core runtime code.
+  - `main.py` acts as a composition/bootstrap file only.
+  - Existing run/resume behavior and TUI command behavior remain functionally equivalent.
+  - Compile + smoke run succeed after refactor.
+- Dependencies: BL-009
+- Guided by decisions: D1, D2, D7
+
+### BL-019 Technical debt hardening pass
+- Priority: `P0`
+- Status: `Open`
+- Notes:
+  - Quick debt snapshot:
+    - Broad `except Exception` handling is widely used and can hide actionable failures.
+    - Error reporting is inconsistent between engines/stage execution paths.
+    - Some validation/guardrail logic is duplicated across stages.
+- Goal: reduce fragility and improve debuggability after modularization.
+- Scope:
+  - Replace broad exception handling with narrower/typed handling where practical.
+  - Standardize error envelopes/reason codes for stage and task failures.
+  - Centralize shared validations (message envelope, citation checks, gate checks) in reusable services.
+  - Add targeted regression tests for failure scenarios and gate enforcement.
+- Acceptance criteria:
+  - Critical paths expose consistent, actionable failure reasons.
+  - Key failure modes (fetch failure, inference failure, invalid citations, invalid routing) are covered by tests.
+  - No behavior regressions in end-to-end TUI flow.
+- Dependencies: BL-018
+- Guided by decisions: D3, D5
 
 ## P1
 
 ### BL-010 Run budgets, retries, and failure handling
 - Priority: `P1`
+- Status: `Open`
+- Notes: Centralized timeout/retry/budget enforcement is still pending.
 - Goal: enforce runtime and cost constraints consistently.
 - Scope:
   - Per-task timeout policy.
@@ -152,6 +219,8 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-011 Checkpoint UX and run-time approvals
 - Priority: `P1`
+- Status: `Partial`
+- Notes: Ingest/Final approval flow exists; richer reject-routing + optional Outline gate configuration remain open.
 - Goal: make approvals explicit and auditable.
 - Scope:
   - Checkpoint prompts at Ingest and Final.
@@ -165,6 +234,8 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-012 Security baseline controls
 - Priority: `P1`
+- Status: `Open`
+- Notes: URL/network restrictions and secret-redaction policies are not fully enforced yet.
 - Goal: apply minimal safe defaults for web-enabled research.
 - Scope:
   - Block non-HTTP(S), localhost, and private-network URLs.
@@ -178,6 +249,8 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-013 Observability and diagnostics
 - Priority: `P1`
+- Status: `Partial`
+- Notes: Event log, task table, and run context exist; consolidated timeline/diagnostic commanding still needs expansion.
 - Goal: make failures debuggable without deep code inspection.
 - Scope:
   - Structured logs for run, stage, task, and message events.
@@ -191,6 +264,8 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-014 Lightweight automated testing
 - Priority: `P1`
+- Status: `Open`
+- Notes: No committed automated smoke suite yet.
 - Goal: maintain confidence while iterating quickly.
 - Scope:
   - E2E smoke tests (include `data/input.txt`).
@@ -206,6 +281,7 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-015 Dynamic agent archetype expansion
 - Priority: `P2`
+- Status: `Open`
 - Goal: support richer specialist roles based on plan complexity.
 - Scope:
   - Programmatic creation of specialized agents (analyst, copywriter variant, fact-checker).
@@ -217,6 +293,7 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-016 Quality optimization loop
 - Priority: `P2`
+- Status: `Open`
 - Goal: improve writing quality and consistency over baseline pass criteria.
 - Scope:
   - Heuristic or model-based rewrite strategies by rubric dimension.
@@ -228,6 +305,7 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-017 Export formats and publishing helpers
 - Priority: `P2`
+- Status: `Open`
 - Goal: improve downstream publishing workflow.
 - Scope:
   - Export to plain text and markdown with references.
@@ -242,5 +320,6 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 2. BL-003, BL-005
 3. BL-006, BL-007, BL-008
 4. BL-009 (end-to-end usable PoC milestone)
-5. BL-010 through BL-014
-6. BL-015 through BL-017
+5. BL-018, BL-019 (modularization + debt hardening)
+6. BL-010 through BL-014
+7. BL-015 through BL-017
