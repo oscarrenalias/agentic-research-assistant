@@ -309,17 +309,43 @@ This section captures implementation decisions as we finalize them.
   - Faster to build and iterate than a web UI for PoC goals.
   - Improves observability while debugging multi-agent orchestration.
 - v0 interface scope:
-  - Start a run from input text/file.
-  - Show live stage status and task ledger summaries.
-  - View shared chat log and per-agent filtered views.
-  - Approve/reject checkpoints when required.
+  - Start or resume a run from input text/file + SQLite state.
+  - Keep the shared chat as the primary interaction surface for user and agents.
+  - Show task/stage context in side panels while preserving chat as the dominant area.
+  - Support natural-language iteration with coordinator before approval.
   - Inspect evidence pack and references before finalization.
   - Export final post + references to file.
-- Suggested v0 command set:
-  - `run <input_path>`
-  - `status <run_id>`
-  - `show-chat <run_id> [--agent <agent_id>]`
-  - `show-sources <run_id>`
-  - `approve <run_id> <checkpoint>`
-  - `reject <run_id> <checkpoint> --reason "..."`
-  - `export <run_id> --out <path>`
+
+## Decision 8: Chat-centric TUI behavior
+- Status: decided
+- Choice: chat-first interactive TUI layout and workflow
+- Rationale:
+  - User should interact naturally, not by issuing many procedural CLI commands.
+  - Coordinator reasoning, plans, and tasking should be visible in plain English.
+  - Shared chat transparency is key to the "agents as teammates" objective.
+- v0 defaults:
+  - Layout:
+    - Bottom half of the screen is dedicated to shared chat.
+    - Message input is anchored at the very bottom, like a chatbot.
+    - Upper area shows compact run/task context panels.
+  - Plan visibility:
+    - Coordinator plan is posted in chat (not a dedicated plan panel).
+    - User can request plan recall with `/plan`.
+  - Message rendering:
+    - Chat supports Markdown rendering for readable bullets and structure.
+    - Coordinator and agent instructions are visible in plain English in chat.
+  - Progress/status:
+    - No separate status panel.
+    - Runtime progress is posted in chat with ASCII markers.
+    - In-progress updates use a spinner-style marker; completion uses a success marker.
+  - Human-in-the-loop iteration:
+    - Any input that is not explicit approval is treated as coordinator feedback/iteration.
+    - Coordinator uses inference to decide whether to continue iterating or proceed.
+    - Research agents may post clarifying questions; coordinator responds in shared chat.
+  - Chat command defaults:
+    - `/help`: list available chat commands.
+    - `/plan`: show current coordinator plan.
+    - `/run`: show run/checkpoint summary.
+    - `/agents`: list current agents with task-status counts.
+    - `/agent <agent_id>`: inspect one agent's tasks and outputs.
+    - `/task <task_id_or_prefix>`: inspect one specific task output/error.
