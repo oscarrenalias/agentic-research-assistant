@@ -158,12 +158,24 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 
 ### BL-018 Modularize the application architecture
 - Priority: `P0`
-- Status: `Open`
+- Status: `Completed`
 - Notes:
   - Quick debt snapshot:
-    - `main.py` is currently ~3347 lines.
-    - Core concerns are tightly coupled in one file (TUI, orchestration, storage, engines, parsing, validation, export).
-    - High-complexity control paths exist in single methods (notably slash command handling and stage advancement).
+    - Runtime decomposition is in progress; structure is now modular under `app/`.
+    - Remaining debt is mostly behavioral hardening/verification rather than file-size coupling.
+  - Progress update:
+    - Root entrypoint is now thin (`main.py`), with runtime moved under `app/`.
+    - TUI runtime lives in `app/tui.py`.
+    - Stage progression and slash-command handling have been extracted to `app/stages.py` and `app/commands.py`.
+    - Shared domain constants and dataclasses were extracted to `app/domain/models.py`.
+    - SQLite schema and `RunRepository` were extracted to `app/storage/repository.py`.
+    - Inference engines were extracted to `app/engines/` (`coordinator`, `research`, `writing`, `review`).
+    - Service helpers were extracted to `app/services/` (`ingest`, `sources`, `citations`, `export`).
+    - Workflow-heavy stage/research/content logic was extracted to `app/workflow/` (`research`, `content`).
+    - UI/chat presentation and formatting logic was extracted to `app/ui/presentation.py`.
+    - Run lifecycle/state/render orchestration was extracted to `app/ui/runtime.py`.
+    - `app/tui.py` was reduced to ~526 lines; all runtime modules are now below 600 lines.
+    - Compile validation currently passes after refactor (`uv run python -m py_compile ...`).
 - Goal: split the single-file implementation into maintainable modules without changing behavior.
 - Scope:
   - Create module boundaries (for example: `ui/`, `engines/`, `domain/`, `storage/`, `services/`, `utils/`).
