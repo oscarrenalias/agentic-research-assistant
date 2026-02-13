@@ -1,0 +1,38 @@
+Working title: Is the AI Capex out of control?
+
+Objective:
+Assess whether hyperscalers' AI capex surge is backed by durable demand or setting up a potential oversupply reset.
+
+Audience:
+Tech leaders, generalists, cloud experts, AI architects and experts
+
+Rough angle:
+- Massive Capex investments from hyperscalers
+- RPO being touted as through teh roof, but there's no guarantee that the demand will materialize and sometimes RPO-based contracts have clauses that trigger renegotiation if demand isn't in line with expectations
+- 45% of Microsoft's 45% RPO is from OpenAI
+- The market could take major downturn if demand doesn't grow as per these Capex investments necessitate
+
+Core points to explore:
+- Separate booked demand from realized demand: how much current AI backlog converts to sustained production usage vs pilots/experiments.
+- Analyze RPO quality, not just size: concentration risk (e.g., dependence on a few large buyers), contract duration, and renegotiation/cancellation clauses.
+- Track utilization signals across the stack: GPU cluster occupancy, inference volumes, enterprise deployment rates, and workload stickiness after POCs.
+- Compare capex pace vs monetization pace: are hyperscalers scaling infrastructure faster than AI revenue/margin expansion can absorb?
+- Assess second-order constraints: power availability, grid interconnection delays, and construction lead times that could create stranded or mistimed capacity.
+- Identify who bears reset risk first: hyperscalers, colocation/data-center operators, chip supply chain, utilities, or enterprise customers.
+- Impact on the industry, risks of hyperscaler prices going up to account for lower AI revenue
+
+Sources:
+- Earnings call transcripts and investor presentations from hyperscalers (Microsoft, Google, Amazon, Meta) on AI capex and data center buildout.
+- SEC filings (10-K/10-Q) from hyperscalers and data center operators (Equinix, Digital Realty) for disclosed AI infrastructure and power investment trends.
+- Industry trackers from Synergy Research Group, Dell'Oro Group, and CBRE/JLL on global data center capacity, vacancy, and capital deployment.
+- https://cloudwars.com/cloud-wars-minute/hyperscalers-backlog-hits-1-63-trillion-spurring-645b-in-2026-capex/
+
+Tone and style constraints:
+- Evidence-first, no hype.
+- Mid to long paragraphs, concrete claims, and clear source attribution.
+- Can be a bit provocative, as long as provocative claims are substantiated
+- End with a call to action
+- No emojis
+
+Draft output preference:
+- 1 LinkedIn post draft (~900-1300 characters)

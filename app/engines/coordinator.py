@@ -374,9 +374,9 @@ class CoordinatorEngine:
             analyst_tasks.append(
                 {
                     "agent_id": f"research_agent_{i+1}",
-                    "objective": "Extract one verifiable claim relevant to the user objective.",
+                    "objective": "Extract 4-5 verifiable claims relevant to the user objective.",
                     "source_hint": source_hint,
-                    "instructions": "Find one concrete claim, include caveats, and estimate confidence.",
+                    "instructions": "Find 4-5 concrete claims, include caveats, and estimate confidence for each.",
                     "priority": "normal",
                 }
             )
@@ -410,9 +410,9 @@ class CoordinatorEngine:
             normalized_tasks.append(
                 {
                     "agent_id": str(task.get("agent_id", f"research_agent_{i+1}")),
-                    "objective": str(task.get("objective", "Extract one relevant claim.")),
+                    "objective": str(task.get("objective", "Extract 4-5 relevant claims.")),
                     "source_hint": str(task.get("source_hint", "")),
-                    "instructions": str(task.get("instructions", "Provide one evidence-backed claim.")),
+                    "instructions": str(task.get("instructions", "Provide 4-5 evidence-backed claims.")),
                     "priority": str(task.get("priority", "normal")),
                 }
             )

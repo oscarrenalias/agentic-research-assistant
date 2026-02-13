@@ -160,7 +160,7 @@ class AgenticTUI(App[None]):
         if not self.research_engine.enabled and self.research_engine.init_error:
             self._log_event(f"Research engine fallback mode: {self.research_engine.init_error}")
         if not self.writing_engine.enabled and self.writing_engine.init_error:
-            self._log_event(f"Writing engine fallback mode: {self.writing_engine.init_error}")
+            self._log_event(f"Writing engine inference unavailable: {self.writing_engine.init_error}")
         if not self.review_engine.enabled and self.review_engine.init_error:
             self._log_event(f"Review engine fallback mode: {self.review_engine.init_error}")
         self.set_focus(self.query_one("#input-bar", Input))
@@ -335,7 +335,7 @@ class AgenticTUI(App[None]):
             f"- Objective: {objective}\n"
             f"- Instructions: {instructions}\n"
             f"- Source candidate: {source}\n"
-            "- Expected output: one evidence-backed claim + evidence note + confidence."
+            "- Expected output: 4-5 evidence-backed claims + evidence notes + confidence."
         )
 
     async def _run_instruction_review_loop(self, tasks: list[TaskRecord]) -> None:
@@ -612,8 +612,8 @@ class AgenticTUI(App[None]):
                         "objective": f"Collect evidence for outline revision focus: {focus_item[:160]}",
                         "source_hint": source_hint,
                         "instructions": (
-                            "Extract one verifiable claim that directly supports the requested outline change. "
-                            "Include caveats and confidence."
+                            "Extract 4-5 verifiable claims that directly support the requested outline change. "
+                            "Include caveats and confidence for each claim."
                         ),
                         "priority": "high",
                     }
@@ -650,7 +650,23 @@ class AgenticTUI(App[None]):
                 self._log_event("Outline feedback triggered targeted supplemental research.")
 
         self._set_status("Applying your outline feedback...", level="in_progress")
-        revised_outline = await asyncio.to_thread(self._refresh_outline_from_current_evidence, feedback_text)
+        try:
+            revised_outline = await asyncio.to_thread(self._refresh_outline_from_current_evidence, feedback_text)
+        except Exception as exc:  # noqa: BLE001
+            self._post_chat_message(
+                ChatMessage(
+                    msg_id=str(uuid.uuid4()),
+                    from_agent="coordinator",
+                    to_agent="user",
+                    message_type="status",
+                    stage="Outline",
+                    priority="high",
+                    timestamp=now_iso(),
+                    content=f"I could not apply outline feedback: {exc}",
+                )
+            )
+            self._set_status("Outline revision failed.", level="error")
+            return
         if not isinstance(revised_outline, dict) or not revised_outline:
             self._post_chat_message(
                 ChatMessage(
@@ -729,15 +745,18 @@ class AgenticTUI(App[None]):
                 "no_fabricated_citations": True,
             },
         }
-        revised = self.writing_engine.revise_draft(
-            objective=objective,
-            audience=audience,
-            tone=tone,
-            constraints=constraints,
-            draft=draft_text,
-            critique=pseudo_critique,
-            claims=claims,
-        )
+        try:
+            revised = self.writing_engine.revise_draft(
+                objective=objective,
+                audience=audience,
+                tone=tone,
+                constraints=constraints,
+                draft=draft_text,
+                critique=pseudo_critique,
+                claims=claims,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "message": str(exc)}
         revised_text = str(revised.get("revised_draft", draft_text)).strip()
         if not revised_text:
             return {"ok": False, "message": "Draft revision returned empty content."}

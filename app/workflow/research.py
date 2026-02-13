@@ -20,8 +20,8 @@ async def run_instruction_review_loop(app: AgenticTUI, tasks: list[TaskRecord]) 
     app._log_event("Instruction review loop started.")
     for task in tasks:
         brief = app.task_briefs.get(task.task_id, {})
-        objective = brief.get("objective", "Extract one evidence-backed claim.")
-        instructions = brief.get("instructions", "Provide claim and confidence.")
+        objective = brief.get("objective", "Extract 4-5 evidence-backed claims.")
+        instructions = brief.get("instructions", "Provide findings with confidence.")
         source = task.input_ref
 
         review = await asyncio.to_thread(
@@ -49,8 +49,8 @@ async def run_instruction_review_loop(app: AgenticTUI, tasks: list[TaskRecord]) 
             )
 
             clarification = (
-                "Clarification: focus on one concrete claim directly tied to the task objective; "
-                "include one supporting note and confidence from 0 to 1."
+                "Clarification: provide 4-5 concrete claims directly tied to the task objective; "
+                "include supporting notes and confidence from 0 to 1 for each claim."
             )
             app._post_chat_message(
                 ChatMessage(
@@ -104,8 +104,8 @@ def run_research_subtask(app: AgenticTUI, task: TaskRecord) -> dict[str, object]
     tone = app.package.tone if app.package else ""
     constraints = app.package.constraints if app.package else []
     brief = app.task_briefs.get(task.task_id, {})
-    task_objective = brief.get("objective", "Extract one evidence-backed claim.")
-    task_instructions = brief.get("instructions", "Provide claim with confidence and caveats.")
+    task_objective = brief.get("objective", "Extract 4-5 evidence-backed claims.")
+    task_instructions = brief.get("instructions", "Provide findings with confidence and caveats.")
     source_payload = fetch_source_material(task.input_ref)
     analysis = app.research_engine.analyze_source(
         source_ref=str(source_payload.get("source_ref", task.input_ref)),
@@ -117,6 +117,9 @@ def run_research_subtask(app: AgenticTUI, task: TaskRecord) -> dict[str, object]
         task_objective=task_objective,
         task_instructions=task_instructions,
     )
+    findings = analysis.get("findings", [])
+    if not isinstance(findings, list):
+        findings = []
     return {
         "source_ref": task.input_ref,
         "source_url": str(source_payload.get("url", "")),
@@ -125,10 +128,7 @@ def run_research_subtask(app: AgenticTUI, task: TaskRecord) -> dict[str, object]
         "source_published_at": str(source_payload.get("published_at", "")),
         "source_retrieved_at": str(source_payload.get("retrieved_at", now_iso())),
         "fetch_status": str(source_payload.get("fetch_status", "unknown")),
-        "claim": analysis["claim"],
-        "evidence_note": analysis["evidence_note"],
-        "confidence": float(analysis["confidence"]),
-        "risk_flags": analysis["risk_flags"],
+        "findings": findings[:5],
     }
 
 
@@ -151,9 +151,9 @@ async def execute_research_parallel(app: AgenticTUI) -> dict[str, object]:
             inferred_tasks.append(
                 {
                     "agent_id": str(item.get("agent_id", f"research_agent_{i+1}")),
-                    "objective": str(item.get("objective", "Extract one evidence-backed claim.")),
+                    "objective": str(item.get("objective", "Extract 4-5 evidence-backed claims.")),
                     "source_hint": str(item.get("source_hint", "")),
-                    "instructions": str(item.get("instructions", "Provide one claim plus confidence.")),
+                    "instructions": str(item.get("instructions", "Provide 4-5 claims with confidence.")),
                     "priority": str(item.get("priority", "normal")),
                 }
             )
@@ -163,9 +163,9 @@ async def execute_research_parallel(app: AgenticTUI) -> dict[str, object]:
             inferred_tasks.append(
                 {
                     "agent_id": f"research_agent_{(i % 3) + 1}",
-                    "objective": "Extract one evidence-backed claim relevant to objective.",
+                    "objective": "Extract 4-5 evidence-backed claims relevant to objective.",
                     "source_hint": source,
-                    "instructions": "Provide claim, note, and confidence.",
+                    "instructions": "Provide 4-5 claims with notes and confidence.",
                     "priority": "normal",
                 }
             )
@@ -219,8 +219,8 @@ async def execute_research_parallel(app: AgenticTUI) -> dict[str, object]:
                 timestamp=now_iso(),
                 task_id=task.task_id,
                 content=app._format_task_instruction_message(
-                    brief.get("objective", "Extract one evidence-backed claim."),
-                    brief.get("instructions", "Provide claim and confidence."),
+                    brief.get("objective", "Extract 4-5 evidence-backed claims."),
+                    brief.get("instructions", "Provide findings with confidence."),
                     task.input_ref,
                 ),
             )
@@ -258,7 +258,7 @@ async def execute_research_parallel(app: AgenticTUI) -> dict[str, object]:
                     priority="normal",
                     timestamp=now_iso(),
                     task_id=task.task_id,
-                    content=f"Claim extracted (confidence={result.get('confidence', 0.0)}).",
+                    content=f"Findings extracted (count={len(result.get('findings', []))}).",
                 )
             )
             source_ref = str(result.get("source_ref", task.input_ref))
@@ -267,6 +267,40 @@ async def execute_research_parallel(app: AgenticTUI) -> dict[str, object]:
             publisher = str(result.get("source_publisher", ""))
             published_at = str(result.get("source_published_at", ""))
             retrieved_at = str(result.get("source_retrieved_at", now_iso()))
+            findings = result.get("findings", [])
+            if not isinstance(findings, list):
+                findings = []
+            normalized_findings: list[dict[str, object]] = []
+            for finding in findings[:5]:
+                if not isinstance(finding, dict):
+                    continue
+                confidence_raw = finding.get("confidence", 0.5)
+                try:
+                    confidence = float(confidence_raw)
+                except (TypeError, ValueError):
+                    confidence = 0.5
+                risk_flags_raw = finding.get("risk_flags", [])
+                if not isinstance(risk_flags_raw, list):
+                    risk_flags_raw = []
+                normalized_findings.append(
+                    {
+                        "claim": str(finding.get("claim", "")),
+                        "evidence_note": str(finding.get("evidence_note", "")),
+                        "confidence": confidence,
+                        "risk_flags": [str(x) for x in risk_flags_raw],
+                    }
+                )
+            if not normalized_findings:
+                normalized_findings = [
+                    {
+                        "claim": "No structured findings returned.",
+                        "evidence_note": "Research output was empty for this source.",
+                        "confidence": 0.2,
+                        "risk_flags": ["empty_findings"],
+                    }
+                ]
+
+            avg_confidence = sum(float(item["confidence"]) for item in normalized_findings) / len(normalized_findings)
             source_id = f"S{source_id_counter}"
             source_id_counter += 1
             source_entries.append(
@@ -278,21 +312,22 @@ async def execute_research_parallel(app: AgenticTUI) -> dict[str, object]:
                     "published_at": published_at,
                     "retrieved_at": retrieved_at,
                     "tier": infer_source_tier(source_ref),
-                    "confidence": float(result.get("confidence", 0.5)),
-                    "key_claims": [str(result.get("claim", ""))],
+                    "confidence": avg_confidence,
+                    "key_claims": [str(item["claim"]) for item in normalized_findings],
                     "fetch_status": str(result.get("fetch_status", "unknown")),
                 }
             )
-            claims.append(
-                {
-                    "source_id": source_id,
-                    "source_ref": source_ref,
-                    "claim": str(result.get("claim", "")),
-                    "evidence_note": str(result.get("evidence_note", "")),
-                    "confidence": float(result.get("confidence", 0.5)),
-                    "risk_flags": [str(x) for x in result.get("risk_flags", [])],
-                }
-            )
+            for finding in normalized_findings:
+                claims.append(
+                    {
+                        "source_id": source_id,
+                        "source_ref": source_ref,
+                        "claim": str(finding["claim"]),
+                        "evidence_note": str(finding["evidence_note"]),
+                        "confidence": float(finding["confidence"]),
+                        "risk_flags": [str(x) for x in finding["risk_flags"]],
+                    }
+                )
         else:
             app._set_task_status(task, status="failed", error=str(err))
             app._log_event(f"Research subtask failed: {task.task_id[:8]} ({err})")

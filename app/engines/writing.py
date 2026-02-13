@@ -130,42 +130,11 @@ class WritingEngine:
                 return json.loads(match.group(0))
             raise
 
-    @staticmethod
-    def _fallback_outline(claims: list[dict[str, object]]) -> dict[str, object]:
-        sections = ["Hook", "Context", "Evidence", "Implications", "Takeaway"]
-        source_ids = [str(c.get("source_id", "")) for c in claims[:5] if str(c.get("source_id", ""))]
-        return {
-            "hook": "Why this topic matters now.",
-            "sections": sections,
-            "argument_flow": sections,
-            "evidence_map": [{"section": "Evidence", "source_ids": source_ids}],
-        }
-
-    @staticmethod
-    def _fallback_draft(objective: str, claims: list[dict[str, object]]) -> str:
-        lines = [
-            f"{objective}",
-            "",
-            "Evidence highlights:",
-        ]
-        for claim in claims[:4]:
-            marker = str(claim.get("source_id", "S1"))
-            text = str(claim.get("claim", ""))
-            lines.append(f"- {text} [{marker}]")
-        lines.append("")
-        lines.append("Takeaway: Practical, evidence-backed action is possible with trade-offs.")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _fallback_revision(draft: str) -> dict[str, object]:
-        revised = draft.strip()
-        if revised and not revised.endswith("\n"):
-            revised = f"{revised}\n"
-        revised += "\nRevision note: tightened structure and clarified evidence framing."
-        return {
-            "revised_draft": revised,
-            "changelog": ["Tightened structure.", "Clarified evidence framing."],
-        }
+    def _require_chain(self, chain: Any, operation: str) -> None:
+        if self.enabled and chain is not None:
+            return
+        reason = self._init_error or "model chain not initialized"
+        raise RuntimeError(f"{operation} failed: writing inference unavailable ({reason}).")
 
     def create_outline(
         self,
@@ -175,8 +144,7 @@ class WritingEngine:
         tone: str,
         claims: list[dict[str, object]],
     ) -> dict[str, object]:
-        if not self.enabled or self._outline_chain is None:
-            return self._fallback_outline(claims)
+        self._require_chain(self._outline_chain, "Outline generation")
         try:
             raw = self._outline_chain.invoke(
                 {
@@ -187,14 +155,20 @@ class WritingEngine:
                 }
             )
             parsed = self._parse_llm_json(raw)
+            hook = parsed.get("hook")
+            sections = parsed.get("sections")
+            argument_flow = parsed.get("argument_flow")
+            evidence_map = parsed.get("evidence_map")
+            if not isinstance(hook, str) or not isinstance(sections, list) or not isinstance(argument_flow, list) or not isinstance(evidence_map, list):
+                raise ValueError("invalid outline schema")
             return {
-                "hook": str(parsed.get("hook", "Why this topic matters now.")),
-                "sections": [str(x) for x in parsed.get("sections", [])],
-                "argument_flow": [str(x) for x in parsed.get("argument_flow", [])],
-                "evidence_map": parsed.get("evidence_map", []),
+                "hook": hook,
+                "sections": [str(x) for x in sections],
+                "argument_flow": [str(x) for x in argument_flow],
+                "evidence_map": evidence_map,
             }
-        except Exception:
-            return self._fallback_outline(claims)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Outline generation failed: {exc}") from exc
 
     def create_draft(
         self,
@@ -206,10 +180,9 @@ class WritingEngine:
         outline: dict[str, object],
         claims: list[dict[str, object]],
     ) -> str:
-        if not self.enabled or self._draft_chain is None:
-            return self._fallback_draft(objective, claims)
+        self._require_chain(self._draft_chain, "Draft generation")
         try:
-            return str(
+            draft = str(
                 self._draft_chain.invoke(
                     {
                         "objective": objective,
@@ -221,8 +194,11 @@ class WritingEngine:
                     }
                 )
             ).strip()
-        except Exception:
-            return self._fallback_draft(objective, claims)
+            if not draft:
+                raise ValueError("empty draft")
+            return draft
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Draft generation failed: {exc}") from exc
 
     def revise_outline(
         self,
@@ -234,15 +210,7 @@ class WritingEngine:
         claims: list[dict[str, object]],
         feedback: str,
     ) -> dict[str, object]:
-        if not self.enabled or self._outline_revise_chain is None:
-            fallback = dict(outline) if isinstance(outline, dict) else self._fallback_outline(claims)
-            fallback.setdefault("changelog", [])
-            changelog = fallback.get("changelog", [])
-            if isinstance(changelog, list):
-                changelog.append("Captured user outline feedback (fallback mode).")
-            else:
-                fallback["changelog"] = ["Captured user outline feedback (fallback mode)."]
-            return fallback
+        self._require_chain(self._outline_revise_chain, "Outline revision")
         try:
             raw = self._outline_revise_chain.invoke(
                 {
@@ -255,17 +223,22 @@ class WritingEngine:
                 }
             )
             parsed = self._parse_llm_json(raw)
+            hook = parsed.get("hook")
+            sections = parsed.get("sections")
+            argument_flow = parsed.get("argument_flow")
+            evidence_map = parsed.get("evidence_map")
+            changelog = parsed.get("changelog")
+            if not isinstance(hook, str) or not isinstance(sections, list) or not isinstance(argument_flow, list) or not isinstance(evidence_map, list) or not isinstance(changelog, list):
+                raise ValueError("invalid outline revision schema")
             return {
-                "hook": str(parsed.get("hook", "Why this topic matters now.")),
-                "sections": [str(x) for x in parsed.get("sections", [])],
-                "argument_flow": [str(x) for x in parsed.get("argument_flow", [])],
-                "evidence_map": parsed.get("evidence_map", []),
-                "changelog": [str(x) for x in parsed.get("changelog", [])],
+                "hook": hook,
+                "sections": [str(x) for x in sections],
+                "argument_flow": [str(x) for x in argument_flow],
+                "evidence_map": evidence_map,
+                "changelog": [str(x) for x in changelog],
             }
-        except Exception:
-            fallback = dict(outline) if isinstance(outline, dict) else self._fallback_outline(claims)
-            fallback["changelog"] = ["Outline revision inference failed; keeping current outline."]
-            return fallback
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Outline revision failed: {exc}") from exc
 
     def revise_draft(
         self,
@@ -278,8 +251,7 @@ class WritingEngine:
         critique: dict[str, object],
         claims: list[dict[str, object]],
     ) -> dict[str, object]:
-        if not self.enabled or self._revise_chain is None:
-            return self._fallback_revision(draft)
+        self._require_chain(self._revise_chain, "Draft revision")
         try:
             raw = self._revise_chain.invoke(
                 {
@@ -293,10 +265,13 @@ class WritingEngine:
                 }
             )
             parsed = self._parse_llm_json(raw)
+            revised_draft = parsed.get("revised_draft")
+            changelog = parsed.get("changelog")
+            if not isinstance(revised_draft, str) or not revised_draft.strip() or not isinstance(changelog, list):
+                raise ValueError("invalid draft revision schema")
             return {
-                "revised_draft": str(parsed.get("revised_draft", draft)).strip(),
-                "changelog": [str(x) for x in parsed.get("changelog", [])],
+                "revised_draft": revised_draft.strip(),
+                "changelog": [str(x) for x in changelog],
             }
-        except Exception:
-            return self._fallback_revision(draft)
-
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Draft revision failed: {exc}") from exc

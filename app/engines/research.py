@@ -31,8 +31,9 @@ class ResearchEngine:
                         "system",
                         (
                             "You are a research analyst. Return ONLY compact JSON with keys: "
-                            "claim (string), evidence_note (string), confidence (float 0-1), "
-                            "risk_flags (array of strings). No markdown."
+                            "findings (array of 4-5 objects). "
+                            "Each findings item must have keys: claim (string), evidence_note (string), "
+                            "confidence (float 0-1), risk_flags (array of strings). No markdown."
                         ),
                     ),
                     (
@@ -46,7 +47,7 @@ class ResearchEngine:
                             "Task instructions: {task_instructions}\n"
                             "Source reference: {source_ref}\n"
                             "Source material excerpt: {source_material}\n"
-                            "Task: extract one evidence-backed claim from this source material."
+                            "Task: extract 4 to 5 distinct evidence-backed claims from this source material."
                         ),
                     ),
                 ]
@@ -93,6 +94,56 @@ class ResearchEngine:
                 return json.loads(match.group(0))
             raise
 
+    @staticmethod
+    def _normalize_findings(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+        findings_raw = parsed.get("findings", [])
+        if not isinstance(findings_raw, list):
+            findings_raw = []
+
+        findings: list[dict[str, Any]] = []
+        for item in findings_raw:
+            if not isinstance(item, dict):
+                continue
+            confidence_raw = item.get("confidence", 0.5)
+            try:
+                confidence = float(confidence_raw)
+            except (TypeError, ValueError):
+                confidence = 0.5
+            risk_flags_raw = item.get("risk_flags", [])
+            if not isinstance(risk_flags_raw, list):
+                risk_flags_raw = []
+            findings.append(
+                {
+                    "claim": str(item.get("claim", "")).strip(),
+                    "evidence_note": str(item.get("evidence_note", "")).strip(),
+                    "confidence": confidence,
+                    "risk_flags": [str(x) for x in risk_flags_raw],
+                }
+            )
+            if len(findings) >= 5:
+                break
+
+        if findings:
+            return findings
+
+        # Backward-compatible fallback for legacy single-claim responses.
+        confidence_raw = parsed.get("confidence", 0.5)
+        try:
+            confidence = float(confidence_raw)
+        except (TypeError, ValueError):
+            confidence = 0.5
+        risk_flags_raw = parsed.get("risk_flags", [])
+        if not isinstance(risk_flags_raw, list):
+            risk_flags_raw = []
+        return [
+            {
+                "claim": str(parsed.get("claim", "")).strip(),
+                "evidence_note": str(parsed.get("evidence_note", "")).strip(),
+                "confidence": confidence,
+                "risk_flags": [str(x) for x in risk_flags_raw],
+            }
+        ]
+
     def analyze_source(
         self,
         *,
@@ -107,10 +158,14 @@ class ResearchEngine:
     ) -> dict[str, Any]:
         if not self.enabled or self._chain is None:
             return {
-                "claim": f"Potentially relevant source candidate: {source_ref[:140]}",
-                "evidence_note": "Fallback mode (no model configured).",
-                "confidence": 0.35,
-                "risk_flags": ["model_unavailable"],
+                "findings": [
+                    {
+                        "claim": f"Potentially relevant source candidate: {source_ref[:140]}",
+                        "evidence_note": "Fallback mode (no model configured).",
+                        "confidence": 0.35,
+                        "risk_flags": ["model_unavailable"],
+                    }
+                ],
             }
 
         try:
@@ -128,17 +183,18 @@ class ResearchEngine:
             )
             parsed = self._parse_llm_json(raw)
             return {
-                "claim": str(parsed.get("claim", ""))[:500],
-                "evidence_note": str(parsed.get("evidence_note", ""))[:600],
-                "confidence": float(parsed.get("confidence", 0.5)),
-                "risk_flags": [str(x) for x in parsed.get("risk_flags", [])],
+                "findings": self._normalize_findings(parsed),
             }
         except Exception:  # noqa: BLE001
             return {
-                "claim": f"Potentially relevant source candidate: {source_ref[:140]}",
-                "evidence_note": "Fallback mode (research inference call failed).",
-                "confidence": 0.3,
-                "risk_flags": ["model_call_failed"],
+                "findings": [
+                    {
+                        "claim": f"Potentially relevant source candidate: {source_ref[:140]}",
+                        "evidence_note": "Fallback mode (research inference call failed).",
+                        "confidence": 0.3,
+                        "risk_flags": ["model_call_failed"],
+                    }
+                ],
             }
 
     def review_task_instruction(
@@ -173,4 +229,3 @@ class ResearchEngine:
             return {"decision": decision, "message": message}
         except Exception:
             return {"decision": "clear", "message": "Instructions look clear; I can proceed."}
-
