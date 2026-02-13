@@ -1,47 +1,113 @@
 # Agentic Tasks
 
-Console-first interactive app (TUI) for orchestrating a multi-agent content workflow.
+A terminal-first, multi-stage research and writing workflow built with Textual.
+
+The app ingests a brief, fans out research tasks, builds an outline, drafts content, runs critique/revision gates, and exports a final markdown artifact with references.
+
+Please note that this app is vibe coded, it works but it was mostly intended for me to work with coordinator-agent agentic flows to execute a somewhat realistic process, in this case researching and writing articles.
+
+Main use case is to produce articles for social media based on minimal guidance such as a title, a few key points about the objective, and some sources to get started.
+
+## What it does
+- Runs a staged workflow: `Ingest -> Research -> Outline -> Draft -> Critique -> Revise -> Final`.
+- Persists run state in SQLite so you can resume by `run_id`.
+- Uses coordinator + specialist engines (research, writing, review).
+- Supports chat-driven approvals and iteration at key gates.
+- Exports final output to markdown (`/export`).
+
+## Requirements
+- Python `>=3.14` (from `pyproject.toml`).
+- `uv` for dependency management.
+- Optional: `OPENAI_API_KEY` for inference-enabled mode.
+
+## Install
+```bash
+uv sync
+```
 
 ## Run
-- Install dependencies with `uv`.
-- Start the app:
-  - `uv run python main.py`
-- Use a custom brief file:
-  - `uv run python main.py --input data/input.txt`
-- Use a custom SQLite database path:
-  - `uv run python main.py --db .agentic_tasks.db`
-- Resume an existing run:
-  - `uv run python main.py --run-id <run_id>`
+```bash
+uv run python main.py
+```
 
-## LangChain research mode
-- The Coordinator and Research stages use LangChain + OpenAI when `OPENAI_API_KEY` is set.
-- Optional model override:
-  - `RESEARCH_MODEL` (default: `gpt-4o-mini`)
-  - `COORDINATOR_MODEL` (defaults to `RESEARCH_MODEL`, then `gpt-4o-mini`)
-- Without `OPENAI_API_KEY`, the app stays usable in fallback mode with lower-confidence heuristic claims.
+CLI options:
+- `--input <path>`: input brief file (default: `data/input.txt`)
+- `--db <path>`: SQLite path (default: `.agentic_tasks.db`)
+- `--run-id <id>`: resume an existing run
+
+Examples:
+```bash
+uv run python main.py --input "data/input - ai capex out of control?.txt"
+uv run python main.py --db .agentic_tasks.db
+uv run python main.py --run-id <run_id>
+```
+
+## Environment variables
+`.env` is auto-loaded if present.
+
+- `OPENAI_API_KEY`: enables model-backed coordinator/research/writing/review engines.
+- `RESEARCH_MODEL` (default: `gpt-4o-mini`)
+- `COORDINATOR_MODEL` (default: `RESEARCH_MODEL`, then `gpt-4o-mini`)
+- `WRITING_MODEL` (default: `RESEARCH_MODEL`, then `gpt-4o-mini`)
+- `REVIEW_MODEL` (default: `RESEARCH_MODEL`, then `gpt-4o-mini`)
+
+Without `OPENAI_API_KEY`, the app stays usable with deterministic/fallback behavior, but output quality is lower.
+
+## Input brief format
+Provide a plain-text brief with section headers. Required fields are derived from:
+- `Objective:`
+- `Audience:`
+- `Tone and style constraints:`
+- `Draft output preference:` and/or `Questions to answer explicitly:`
+
+Helpful optional fields:
+- `Working title:` (or `Title:`)
+- `Core points to explore:`
+- `Potential sources to investigate:` (URLs are also auto-detected anywhere in the file)
+
+If required fields are missing, startup fails with a validation error.
 
 ## TUI controls
-- `n`: Advance stage
-- `a`: Approve required checkpoint
-- `d`: Add demo agent status message
-- `q`: Quit
-- Type in the input bar and press Enter to send a user message to coordinator.
-- Type `/plan` in chat to have coordinator post the current structured plan in the chat stream.
-- Research stage now fans out into parallel research subtasks; progress appears in the Task Ledger panel.
-- Before Ingest approval, natural-language input is treated as coordinator feedback and triggers plan revision.
-- Before Ingest approval, coordinator also uses inference to classify your intent (`approve` vs `iterate`) from natural language.
-- After Outline completion, approval is required before Draft, and natural-language feedback triggers coordinator-led outline iteration.
-- During outline iteration, coordinator checks evidence sufficiency and can run targeted supplemental research or a full Research refresh before regenerating the outline.
-- Coordinator plan now includes an explicit execution strategy and priority rationale, visible in chat.
-- Chat messages support markdown rendering for lightweight formatting.
+Keyboard:
+- `n`: advance to next stage
+- `a`: approve current gate
+- `d`: inject demo agent status message
+- `Ctrl+D`: quit
 
-## Notes
-- Ingest is initialized automatically from the input brief.
-- Research cannot start until Ingest approval is granted.
-- Final cannot start until Final approval is granted.
-- Run state is persisted in SQLite:
-  - stage statuses and approvals
-  - artifacts (including normalized task package and stage outputs)
-  - shared chat messages
-  - event log entries
-  - task ledger (`queued`, `in_progress`, `done`, `failed`)
+## Slash commands
+- `/help`
+- `/plan`
+- `/run`
+- `/stages`
+- `/events`
+- `/ledger`
+- `/sources`
+- `/agents`
+- `/inbox <agent_id>`
+- `/agent <agent_id>`
+- `/task <task_id_or_prefix>`
+- `/approve`
+- `/reject <reason>`
+- `/export [path]`
+- `/view compact|detailed`
+- `/scope focus|all`
+- `/internal on|off`
+- `/progress on|off`
+
+## Approval gates
+User approval is required at:
+- `Ingest`
+- `Outline`
+- `Draft`
+- `Final`
+
+At each gate, natural-language feedback can trigger coordinator-led iteration before progressing.
+
+## Persistence and exports
+Run state is stored in SQLite, including:
+- stage statuses and approvals
+- artifacts per stage
+- shared chat messages
+- task ledger and event log
+
+Markdown exports are written to `exports/` by default (or a custom path via `/export <path>`).
