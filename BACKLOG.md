@@ -289,6 +289,23 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 - Dependencies: BL-002, BL-007, BL-008
 - Guided by decisions: D5
 
+### BL-020 Decouple UI adapters from application logic
+- Priority: `P1`
+- Status: `Open`
+- Notes: Core engines/storage are reusable, but stage orchestration and workflow execution still depend on `AgenticTUI`-shaped context.
+- Goal: enable multiple UI frontends (TUI, web UI, API) over one shared orchestration core.
+- Scope:
+  - Introduce an application service/orchestrator layer independent of Textual/TUI widgets.
+  - Replace direct `AgenticTUI` coupling in workflow/stage modules with a narrow runtime interface.
+  - Keep TUI as one adapter implementation; add a web/API adapter without duplicating business logic.
+  - Preserve persisted run state, approvals, and stage-gating semantics across adapters.
+- Acceptance criteria:
+  - Core stage progression and gate logic run without importing TUI classes.
+  - TUI behavior remains functionally equivalent after extraction.
+  - A non-TUI entrypoint (web/API) can initialize/resume runs and trigger stage actions using the same core orchestration.
+- Dependencies: BL-018, BL-019
+- Guided by decisions: D1, D2, D7
+
 ## P2
 
 ### BL-015 Dynamic agent archetype expansion
@@ -333,5 +350,5 @@ This backlog is functionality-first. Decisions in `SPECS.md` are treated as impl
 3. BL-006, BL-007, BL-008
 4. BL-009 (end-to-end usable PoC milestone)
 5. BL-018, BL-019 (modularization + debt hardening)
-6. BL-010 through BL-014
+6. BL-010 through BL-014, BL-020
 7. BL-015 through BL-017
