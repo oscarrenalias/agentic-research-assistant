@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import uuid
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, DataTable, Footer, Header, Input, RichLog, Static
+from textual.containers import Vertical
+from textual.widgets import Button, Footer, Header, Input, RichLog, Static
 
 from app.domain.models import (
     STAGES,
@@ -41,8 +42,11 @@ from app.ui.presentation import (
     build_runtime_context as ui_build_runtime_context,
     command_agent_details as ui_command_agent_details,
     command_agents_summary as ui_command_agents_summary,
+    command_events as ui_command_events,
     command_inbox as ui_command_inbox,
+    command_ledger as ui_command_ledger,
     command_run_summary as ui_command_run_summary,
+    command_stages as ui_command_stages,
     command_sources as ui_command_sources,
     command_task_details as ui_command_task_details,
     format_coordinator_plan_markdown as ui_format_coordinator_plan_markdown,
@@ -88,10 +92,13 @@ class AgenticTUI(App[None]):
     CSS = """
     Screen { layout: vertical; }
     #top { height: 1fr; }
-    #left-pane, #right-pane {
+    #content-pane {
         width: 1fr;
         border: round $panel;
         padding: 0 1;
+    }
+    #content-view {
+        height: 1fr;
     }
     #chat-pane {
         height: 1fr;
@@ -104,17 +111,13 @@ class AgenticTUI(App[None]):
     #input-bar {
         height: auto;
     }
-    #run-summary { height: 8; }
-    #stages { height: 12; }
-    #tasks { height: 12; }
-    #event-log { height: 1fr; }
     """
 
     BINDINGS = [
         ("n", "advance_stage", "Advance Stage"),
         ("a", "approve_gate", "Approve Gate"),
         ("d", "demo_message", "Demo Msg"),
-        ("q", "quit", "Quit"),
+        ("ctrl+d", "quit", "Quit"),
     ]
 
     def __init__(self, input_path: Path, db_path: Path, resume_run_id: str | None = None):
@@ -130,7 +133,7 @@ class AgenticTUI(App[None]):
         self.task_briefs: dict[str, dict[str, str]] = {}
         self._spinner_idx = 0
         self.chat_view_mode = "compact"
-        self.chat_scope_mode = "focus"
+        self.chat_scope_mode = "all"
         self.show_internal_messages = False
         self.show_progress_updates = True
         self.repo: RunRepository | None = None
@@ -139,15 +142,10 @@ class AgenticTUI(App[None]):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        with Horizontal(id="top"):
-            with Vertical(id="left-pane"):
-                yield Static("Run not initialized", id="run-summary")
-                yield DataTable(id="stages")
-            with Vertical(id="right-pane"):
-                yield Static("Task Ledger")
-                yield DataTable(id="tasks")
-                yield Static("Events")
-                yield RichLog(id="event-log", wrap=True, highlight=True)
+        with Vertical(id="top"):
+            with Vertical(id="content-pane"):
+                yield Static("Content Workspace")
+                yield RichLog(id="content-view", wrap=True, highlight=True)
         with Vertical(id="chat-pane"):
             yield Static("Shared Chat")
             yield RichLog(id="chat-log", wrap=True, highlight=True)
@@ -155,28 +153,16 @@ class AgenticTUI(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
-        stages = self.query_one("#stages", DataTable)
-        stages.add_columns("Stage", "Status", "Approval")
-        tasks = self.query_one("#tasks", DataTable)
-        tasks.add_columns("Task ID", "Owner", "Stage", "Status")
         self.repo = RunRepository(self.db_path)
         self.repo.init_schema()
         if not self.coordinator_engine.enabled and self.coordinator_engine.init_error:
-            self.query_one("#event-log", RichLog).write(
-                f"Coordinator engine fallback mode: {self.coordinator_engine.init_error}"
-            )
+            self._log_event(f"Coordinator engine fallback mode: {self.coordinator_engine.init_error}")
         if not self.research_engine.enabled and self.research_engine.init_error:
-            self.query_one("#event-log", RichLog).write(
-                f"Research engine fallback mode: {self.research_engine.init_error}"
-            )
+            self._log_event(f"Research engine fallback mode: {self.research_engine.init_error}")
         if not self.writing_engine.enabled and self.writing_engine.init_error:
-            self.query_one("#event-log", RichLog).write(
-                f"Writing engine fallback mode: {self.writing_engine.init_error}"
-            )
+            self._log_event(f"Writing engine fallback mode: {self.writing_engine.init_error}")
         if not self.review_engine.enabled and self.review_engine.init_error:
-            self.query_one("#event-log", RichLog).write(
-                f"Review engine fallback mode: {self.review_engine.init_error}"
-            )
+            self._log_event(f"Review engine fallback mode: {self.review_engine.init_error}")
         self.set_focus(self.query_one("#input-bar", Input))
         self._set_status("Initializing run and coordinator plan...", level="in_progress")
         self.run_worker(self._initialize_run_async(), exclusive=True, group="startup")
@@ -256,6 +242,15 @@ class AgenticTUI(App[None]):
     def _command_run_summary(self) -> str:
         return ui_command_run_summary(self)
 
+    def _command_stages(self) -> str:
+        return ui_command_stages(self)
+
+    def _command_events(self) -> str:
+        return ui_command_events(self)
+
+    def _command_ledger(self) -> str:
+        return ui_command_ledger(self)
+
     def _command_sources(self) -> str:
         return ui_command_sources(self)
 
@@ -331,7 +326,7 @@ class AgenticTUI(App[None]):
             task.error = error
         if self.repo is not None:
             self.repo.upsert_task(task)
-        self._render_tasks()
+        self._render_all()
 
     @staticmethod
     def _format_task_instruction_message(objective: str, instructions: str, source: str) -> str:
@@ -361,6 +356,398 @@ class AgenticTUI(App[None]):
     def _draft_stage_output(self) -> str:
         return workflow_draft_stage_output(self)
 
+    def _outline_gate_pending(self) -> bool:
+        return bool(
+            self.state
+            and self.state.stage_status.get("Outline") == "completed"
+            and self.state.stage_status.get("Draft") == "not_started"
+            and not self.state.approvals.get("Outline", False)
+        )
+
+    def _draft_gate_pending(self) -> bool:
+        return bool(
+            self.state
+            and self.state.stage_status.get("Draft") == "completed"
+            and self.state.stage_status.get("Critique") == "not_started"
+            and not self.state.approvals.get("Draft", False)
+        )
+
+    def _final_gate_pending(self) -> bool:
+        return bool(
+            self.state
+            and self.state.stage_status.get("Revise") == "completed"
+            and not self.state.approvals.get("Final", False)
+        )
+
+    def _gate_context_summary(self, stage: str) -> str:
+        if not self.state:
+            return ""
+        if stage == "Outline":
+            outline = self.state.artifacts.get("approved_outline", {})
+            if isinstance(outline, dict):
+                hook = str(outline.get("hook", "")).strip()
+                sections = outline.get("sections", [])
+                section_count = len(sections) if isinstance(sections, list) else 0
+                return f"hook={hook[:180]}; section_count={section_count}"
+        if stage == "Draft":
+            draft_payload = self.state.artifacts.get("first_draft", "")
+            draft_text = str(draft_payload).strip()
+            return f"draft_chars={len(draft_text)}"
+        if stage == "Final":
+            revised = self.state.artifacts.get("revised_draft", {})
+            if isinstance(revised, dict):
+                revised_text = str(revised.get("revised_draft", "")).strip()
+                passes = bool(revised.get("passes_quality_gate", False))
+                return f"revised_chars={len(revised_text)}; passes_quality_gate={passes}"
+            return "revised_draft_unavailable"
+        return ""
+
+    def _approve_outline(self, decision_text: str) -> None:
+        if not self.state:
+            return
+        self.state.approvals["Outline"] = True
+        self._persist_run_status()
+        self._log_event("Approval granted: Outline checkpoint.")
+        self._post_chat_message(
+            ChatMessage(
+                msg_id=str(uuid.uuid4()),
+                from_agent="user",
+                to_agent="coordinator",
+                message_type="decision",
+                stage="Outline",
+                priority="normal",
+                timestamp=now_iso(),
+                content=decision_text,
+            )
+        )
+        self._render_all()
+
+    def _outline_evidence_summary(self) -> dict[str, object]:
+        outline_payload = self.state.artifacts.get("approved_outline", {}) if self.state else {}
+        outline = outline_payload if isinstance(outline_payload, dict) else {}
+        evidence = self._evidence_pack()
+        claims_payload = evidence.get("claims", []) if isinstance(evidence, dict) else []
+        sources_payload = evidence.get("sources", []) if isinstance(evidence, dict) else []
+        claims = [item for item in claims_payload if isinstance(item, dict)] if isinstance(claims_payload, list) else []
+        sources = [item for item in sources_payload if isinstance(item, dict)] if isinstance(sources_payload, list) else []
+        mapped_source_ids: set[str] = set()
+        evidence_map = outline.get("evidence_map", [])
+        if isinstance(evidence_map, list):
+            for row in evidence_map:
+                if not isinstance(row, dict):
+                    continue
+                src_ids = row.get("source_ids", [])
+                if isinstance(src_ids, list):
+                    for sid in src_ids:
+                        text_sid = str(sid).strip()
+                        if text_sid:
+                            mapped_source_ids.add(text_sid)
+        total_source_ids = {
+            str(item.get("source_id", "")).strip()
+            for item in sources
+            if str(item.get("source_id", "")).strip()
+        }
+        coverage_ratio = 0.0
+        if total_source_ids:
+            coverage_ratio = len(mapped_source_ids & total_source_ids) / len(total_source_ids)
+        return {
+            "claim_count": len(claims),
+            "source_count": len(sources),
+            "mapped_source_count": len(mapped_source_ids),
+            "citation_coverage_ratio": round(coverage_ratio, 3),
+            "source_ids": sorted(list(total_source_ids))[:20],
+        }
+
+    @staticmethod
+    def _merge_evidence_pack(base: dict[str, object], additional: dict[str, object]) -> dict[str, object]:
+        base_sources_raw = base.get("sources", []) if isinstance(base, dict) else []
+        base_claims_raw = base.get("claims", []) if isinstance(base, dict) else []
+        add_sources_raw = additional.get("sources", []) if isinstance(additional, dict) else []
+        add_claims_raw = additional.get("claims", []) if isinstance(additional, dict) else []
+
+        base_sources = [deepcopy(item) for item in base_sources_raw if isinstance(item, dict)]
+        base_claims = [deepcopy(item) for item in base_claims_raw if isinstance(item, dict)]
+        add_sources = [deepcopy(item) for item in add_sources_raw if isinstance(item, dict)]
+        add_claims = [deepcopy(item) for item in add_claims_raw if isinstance(item, dict)]
+
+        existing_ids: set[str] = set()
+        for source in base_sources:
+            source_id = str(source.get("source_id", "")).strip()
+            if source_id:
+                existing_ids.add(source_id)
+
+        id_map: dict[str, str] = {}
+        next_counter = len(existing_ids) + 1
+        for source in add_sources:
+            old_id = str(source.get("source_id", "")).strip()
+            new_id = old_id
+            if not new_id or new_id in existing_ids:
+                while f"S{next_counter}" in existing_ids:
+                    next_counter += 1
+                new_id = f"S{next_counter}"
+                next_counter += 1
+            source["source_id"] = new_id
+            if old_id:
+                id_map[old_id] = new_id
+            existing_ids.add(new_id)
+            base_sources.append(source)
+
+        for claim in add_claims:
+            old_id = str(claim.get("source_id", "")).strip()
+            if old_id in id_map:
+                claim["source_id"] = id_map[old_id]
+            base_claims.append(claim)
+
+        return {
+            "summary": str(additional.get("summary", base.get("summary", ""))) if isinstance(additional, dict) else "",
+            "sources": base_sources,
+            "claims": base_claims,
+        }
+
+    def _refresh_outline_from_current_evidence(self, feedback_text: str) -> dict[str, object]:
+        current_outline = self.state.artifacts.get("approved_outline", {}) if self.state else {}
+        outline_payload = current_outline if isinstance(current_outline, dict) else {}
+        evidence = self._evidence_pack()
+        claims_payload = evidence.get("claims", []) if isinstance(evidence, dict) else []
+        claims = [item for item in claims_payload if isinstance(item, dict)] if isinstance(claims_payload, list) else []
+        objective = self.package.objective if self.package else ""
+        audience = self.package.audience if self.package else ""
+        tone = self.package.tone if self.package else ""
+        return self.writing_engine.revise_outline(
+            objective=objective,
+            audience=audience,
+            tone=tone,
+            outline=outline_payload,
+            claims=claims,
+            feedback=feedback_text,
+        )
+
+    async def _iterate_outline_with_feedback(self, feedback_text: str) -> None:
+        if not self.state:
+            return
+        self._post_chat_message(
+            ChatMessage(
+                msg_id=str(uuid.uuid4()),
+                from_agent="user",
+                to_agent="coordinator",
+                message_type="question",
+                stage="Outline",
+                priority="normal",
+                timestamp=now_iso(),
+                content=feedback_text,
+            )
+        )
+        evidence_summary = self._outline_evidence_summary()
+        current_outline = self.state.artifacts.get("approved_outline", {})
+        outline_payload = current_outline if isinstance(current_outline, dict) else {}
+        objective = self.package.objective if self.package else ""
+        audience = self.package.audience if self.package else ""
+        tone = self.package.tone if self.package else ""
+        decision = await asyncio.to_thread(
+            self.coordinator_engine.decide_outline_feedback,
+            objective=objective,
+            audience=audience,
+            tone=tone,
+            outline=outline_payload,
+            evidence_summary=evidence_summary,
+            feedback=feedback_text,
+        )
+        intent = str(decision.get("intent", "revise_outline")).strip().lower() if isinstance(decision, dict) else "revise_outline"
+        response = (
+            str(decision.get("response_to_user", "I captured your feedback."))
+            if isinstance(decision, dict)
+            else "I captured your feedback."
+        )
+        reasoning = str(decision.get("reasoning_summary", "")) if isinstance(decision, dict) else ""
+        focus = decision.get("research_focus", []) if isinstance(decision, dict) else []
+        focus_list = [str(item) for item in focus] if isinstance(focus, list) else [feedback_text]
+        try:
+            max_tasks = int(decision.get("max_additional_tasks", 3)) if isinstance(decision, dict) else 3
+        except Exception:  # noqa: BLE001
+            max_tasks = 3
+        max_tasks = max(1, min(8, max_tasks))
+        if intent == "approve":
+            self._approve_outline("Outline approved. Proceed to Draft.")
+            self._post_chat_message(
+                ChatMessage(
+                    msg_id=str(uuid.uuid4()),
+                    from_agent="coordinator",
+                    to_agent="user",
+                    message_type="status",
+                    stage="Outline",
+                    priority="normal",
+                    timestamp=now_iso(),
+                    content=response,
+                )
+            )
+            await self.action_advance_stage()
+            return
+        if intent == "question":
+            self._post_chat_message(
+                ChatMessage(
+                    msg_id=str(uuid.uuid4()),
+                    from_agent="coordinator",
+                    to_agent="user",
+                    message_type="status",
+                    stage="Outline",
+                    priority="normal",
+                    timestamp=now_iso(),
+                    content=response,
+                )
+            )
+            self._set_status("Outline unchanged. Ask follow-up or provide revision feedback.", level="done")
+            return
+
+        if intent in {"supplement_research", "rerun_research"}:
+            plan_payload = self.coordinator_plan if isinstance(self.coordinator_plan, dict) else {}
+            base_candidates = list(self.package.source_candidates) if self.package else []
+            fallback_source = base_candidates[0] if base_candidates else (self.package.objective if self.package else "web research")
+            tasks = []
+            for i in range(max_tasks):
+                focus_item = focus_list[i % len(focus_list)] if focus_list else feedback_text
+                source_hint = base_candidates[i % len(base_candidates)] if base_candidates else fallback_source
+                tasks.append(
+                    {
+                        "agent_id": f"research_agent_{(i % 3) + 1}",
+                        "objective": f"Collect evidence for outline revision focus: {focus_item[:160]}",
+                        "source_hint": source_hint,
+                        "instructions": (
+                            "Extract one verifiable claim that directly supports the requested outline change. "
+                            "Include caveats and confidence."
+                        ),
+                        "priority": "high",
+                    }
+                )
+            original_tasks = plan_payload.get("analyst_tasks", []) if isinstance(plan_payload.get("analyst_tasks", []), list) else []
+            self.coordinator_plan["analyst_tasks"] = tasks
+            self._set_status("Coordinator requested additional research for outline feedback...", level="in_progress")
+            try:
+                supplemental = await self._execute_research_parallel()
+            except Exception as exc:  # noqa: BLE001
+                self._post_chat_message(
+                    ChatMessage(
+                        msg_id=str(uuid.uuid4()),
+                        from_agent="coordinator",
+                        to_agent="user",
+                        message_type="status",
+                        stage="Outline",
+                        priority="high",
+                        timestamp=now_iso(),
+                        content=f"Research refresh for outline feedback failed: {exc}",
+                    )
+                )
+                self._set_status("Outline iteration failed during research refresh.", level="error")
+                return
+            finally:
+                self.coordinator_plan["analyst_tasks"] = original_tasks
+            if intent == "rerun_research":
+                self._persist_artifact("evidence_pack", supplemental)
+                self._log_event("Outline feedback triggered full research refresh.")
+            else:
+                existing = self._evidence_pack()
+                merged = self._merge_evidence_pack(existing, supplemental if isinstance(supplemental, dict) else {})
+                self._persist_artifact("evidence_pack", merged)
+                self._log_event("Outline feedback triggered targeted supplemental research.")
+
+        self._set_status("Applying your outline feedback...", level="in_progress")
+        revised_outline = await asyncio.to_thread(self._refresh_outline_from_current_evidence, feedback_text)
+        if not isinstance(revised_outline, dict) or not revised_outline:
+            self._post_chat_message(
+                ChatMessage(
+                    msg_id=str(uuid.uuid4()),
+                    from_agent="coordinator",
+                    to_agent="user",
+                    message_type="status",
+                    stage="Outline",
+                    priority="high",
+                    timestamp=now_iso(),
+                    content="I couldn't produce a valid outline revision. Please refine feedback and retry.",
+                )
+            )
+            self._set_status("Outline revision failed.", level="error")
+            return
+
+        self._persist_artifact("approved_outline", revised_outline)
+        self.state.approvals["Outline"] = False
+        self._persist_run_status()
+        change_items = revised_outline.get("changelog", [])
+        change_note = ""
+        if isinstance(change_items, list) and change_items:
+            change_note = " Key edits: " + "; ".join([str(item) for item in change_items[:4]])
+        reason_note = f"\n\nEvidence check: {reasoning}" if reasoning else ""
+        self._post_chat_message(
+            ChatMessage(
+                msg_id=str(uuid.uuid4()),
+                from_agent="coordinator",
+                to_agent="user",
+                message_type="status",
+                stage="Outline",
+                priority="normal",
+                timestamp=now_iso(),
+                content=f"{response}{change_note}{reason_note}",
+            )
+        )
+        self._post_chat_message(
+            ChatMessage(
+                msg_id=str(uuid.uuid4()),
+                from_agent="coordinator",
+                to_agent="user",
+                message_type="question",
+                stage="Outline",
+                priority="high",
+                timestamp=now_iso(),
+                content=(
+                    "Updated outline is ready. Share more feedback, or approve outline to continue to Draft."
+                ),
+            )
+        )
+        self._set_status("Outline updated. Continue feedback or approve when ready.", level="done")
+        self._render_all()
+
+    def _revise_draft_with_user_feedback(self, feedback_text: str) -> dict[str, object]:
+        draft_payload = self.state.artifacts.get("first_draft", "") if self.state else ""
+        draft_text = str(draft_payload).strip()
+        if not draft_text:
+            return {"ok": False, "message": "No first draft is available yet."}
+
+        claims = []
+        evidence = self._evidence_pack()
+        claims_payload = evidence.get("claims", []) if isinstance(evidence, dict) else []
+        if isinstance(claims_payload, list):
+            claims = [item for item in claims_payload if isinstance(item, dict)]
+
+        objective = self.package.objective if self.package else ""
+        audience = self.package.audience if self.package else ""
+        tone = self.package.tone if self.package else ""
+        constraints = self.package.constraints if self.package else []
+        pseudo_critique: dict[str, object] = {
+            "pass": False,
+            "issues": [feedback_text],
+            "hard_gates": {
+                "factual_accuracy_min": True,
+                "evidence_quality_min": True,
+                "no_fabricated_citations": True,
+            },
+        }
+        revised = self.writing_engine.revise_draft(
+            objective=objective,
+            audience=audience,
+            tone=tone,
+            constraints=constraints,
+            draft=draft_text,
+            critique=pseudo_critique,
+            claims=claims,
+        )
+        revised_text = str(revised.get("revised_draft", draft_text)).strip()
+        if not revised_text:
+            return {"ok": False, "message": "Draft revision returned empty content."}
+        changelog = [str(x) for x in revised.get("changelog", [])]
+        return {
+            "ok": True,
+            "revised_draft": revised_text,
+            "changelog": changelog,
+        }
+
     def _critique_for_draft(self, draft_text: str) -> dict[str, object]:
         return workflow_critique_for_draft(self, draft_text)
 
@@ -387,6 +774,33 @@ class AgenticTUI(App[None]):
 
         if not self.state.approvals.get("Ingest", False):
             self._approve_ingest("Plan approved. Continue.")
+            return
+
+        if self._outline_gate_pending():
+            self._approve_outline("Outline approved. Proceed to Draft.")
+            return
+
+        if (
+            self.state.stage_status.get("Draft") == "completed"
+            and self.state.stage_status.get("Critique") == "not_started"
+            and not self.state.approvals.get("Draft", False)
+        ):
+            self.state.approvals["Draft"] = True
+            self._persist_run_status()
+            self._log_event("Approval granted: Draft checkpoint.")
+            self._post_chat_message(
+                ChatMessage(
+                    msg_id=str(uuid.uuid4()),
+                    from_agent="user",
+                    to_agent="coordinator",
+                    message_type="decision",
+                    stage="Draft",
+                    priority="normal",
+                    timestamp=now_iso(),
+                    content="Draft approved. Proceed to Critique.",
+                )
+            )
+            self._render_all()
             return
 
         if self.state.stage_status.get("Revise") == "completed" and not self.state.approvals.get("Final", False):
@@ -454,8 +868,158 @@ class AgenticTUI(App[None]):
             if intent == "approve":
                 self._approve_ingest(text, auto_advance=True)
                 await self.action_advance_stage()
-            else:
+            elif intent == "iterate":
                 await self._iterate_ingest_with_feedback(text)
+            else:
+                stage = "Ingest"
+                self._post_chat_message(
+                    ChatMessage(
+                        msg_id=str(uuid.uuid4()),
+                        from_agent="user",
+                        to_agent="coordinator",
+                        message_type="question",
+                        stage=stage,
+                        priority="normal",
+                        timestamp=now_iso(),
+                        content=text,
+                    )
+                )
+                reply = self.coordinator_engine.answer_plan_question(
+                    current_plan=self.coordinator_plan,
+                    user_message=text,
+                )
+                self._post_chat_message(
+                    ChatMessage(
+                        msg_id=str(uuid.uuid4()),
+                        from_agent="coordinator",
+                        to_agent="user",
+                        message_type="status",
+                        stage=stage,
+                        priority="normal",
+                        timestamp=now_iso(),
+                        content=reply,
+                    )
+                )
+                self._set_status("Plan unchanged. Ask more questions or request changes.", level="done")
+            return
+
+        if self._outline_gate_pending():
+            intent, reason = self.coordinator_engine.classify_gate_intent(
+                stage="Outline",
+                gate_context=self._gate_context_summary("Outline"),
+                user_message=text,
+            )
+            self._log_event(f"Coordinator gate intent classification (Outline): {intent} ({reason})")
+            if intent == "approve":
+                self._approve_outline(text)
+                await self.action_advance_stage()
+            else:
+                await self._iterate_outline_with_feedback(text)
+            return
+
+        if self._draft_gate_pending():
+            intent, reason = self.coordinator_engine.classify_gate_intent(
+                stage="Draft",
+                gate_context=self._gate_context_summary("Draft"),
+                user_message=text,
+            )
+            self._log_event(f"Coordinator gate intent classification (Draft): {intent} ({reason})")
+            if intent == "approve":
+                self.action_approve_gate()
+                if self.state and self.state.approvals.get("Draft", False):
+                    await self.action_advance_stage()
+                return
+            self._post_chat_message(
+                ChatMessage(
+                    msg_id=str(uuid.uuid4()),
+                    from_agent="user",
+                    to_agent="coordinator",
+                    message_type="question",
+                    stage="Draft",
+                    priority="normal",
+                    timestamp=now_iso(),
+                    content=text,
+                )
+            )
+            self._set_status("Applying your draft feedback...", level="in_progress")
+            revise_result = await asyncio.to_thread(self._revise_draft_with_user_feedback, text)
+            if bool(revise_result.get("ok", False)):
+                revised_text = str(revise_result.get("revised_draft", ""))
+                self._persist_artifact("first_draft", revised_text)
+                self._log_event("Draft revised from user feedback before Critique.")
+                changelog = revise_result.get("changelog", [])
+                change_note = (
+                    "Key edits: " + "; ".join([str(item) for item in changelog[:4]])
+                    if isinstance(changelog, list) and changelog
+                    else "Draft updated based on your feedback."
+                )
+                self._post_chat_message(
+                    ChatMessage(
+                        msg_id=str(uuid.uuid4()),
+                        from_agent="coordinator",
+                        to_agent="user",
+                        message_type="status",
+                        stage="Draft",
+                        priority="normal",
+                        timestamp=now_iso(),
+                        content=f"{change_note}\n\nShare more feedback, or approve draft to move to Critique.",
+                    )
+                )
+                self._set_status("Draft updated. Add more feedback or approve when ready.", level="done")
+                self._render_all()
+            else:
+                fail_msg = str(revise_result.get("message", "Draft revision failed."))
+                self._post_chat_message(
+                    ChatMessage(
+                        msg_id=str(uuid.uuid4()),
+                        from_agent="coordinator",
+                        to_agent="user",
+                        message_type="status",
+                        stage="Draft",
+                        priority="high",
+                        timestamp=now_iso(),
+                        content=f"I could not apply feedback: {fail_msg}",
+                    )
+                )
+                self._set_status("Draft feedback iteration failed.", level="error")
+            return
+
+        if self._final_gate_pending():
+            intent, reason = self.coordinator_engine.classify_gate_intent(
+                stage="Final",
+                gate_context=self._gate_context_summary("Final"),
+                user_message=text,
+            )
+            self._log_event(f"Coordinator gate intent classification (Final): {intent} ({reason})")
+            if intent == "approve":
+                self.action_approve_gate()
+                if self.state and self.state.approvals.get("Final", False):
+                    await self.action_advance_stage()
+            else:
+                self._post_chat_message(
+                    ChatMessage(
+                        msg_id=str(uuid.uuid4()),
+                        from_agent="user",
+                        to_agent="coordinator",
+                        message_type="question",
+                        stage="Final",
+                        priority="normal",
+                        timestamp=now_iso(),
+                        content=text,
+                    )
+                )
+                self._post_chat_message(
+                    ChatMessage(
+                        msg_id=str(uuid.uuid4()),
+                        from_agent="coordinator",
+                        to_agent="user",
+                        message_type="status",
+                        stage="Final",
+                        priority="normal",
+                        timestamp=now_iso(),
+                        content="Final approval is pending. Say approve when you are ready, or share requested changes.",
+                    )
+                )
             return
 
         stage = self._next_stage() or "Final"
@@ -471,11 +1035,43 @@ class AgenticTUI(App[None]):
                 content=text,
             )
         )
-        action, reply = await asyncio.to_thread(
+        action, reply, action_payload = await asyncio.to_thread(
             self.coordinator_engine.runtime_response,
             run_context=self._build_runtime_context(),
             user_message=text,
         )
+        if (
+            action == "revise_draft"
+            and self.state
+            and self.state.stage_status.get("Draft") == "completed"
+            and self.state.stage_status.get("Critique") == "not_started"
+        ):
+            feedback = str(action_payload.get("feedback", "")).strip() if isinstance(action_payload, dict) else ""
+            if not feedback:
+                feedback = text
+            self._set_status("Applying your draft feedback...", level="in_progress")
+            revise_result = await asyncio.to_thread(self._revise_draft_with_user_feedback, feedback)
+            if bool(revise_result.get("ok", False)):
+                revised_text = str(revise_result.get("revised_draft", ""))
+                self._persist_artifact("first_draft", revised_text)
+                self._log_event("Draft revised from user feedback before Critique.")
+                changelog = revise_result.get("changelog", [])
+                change_note = (
+                    "Key edits: " + "; ".join([str(item) for item in changelog[:4]])
+                    if isinstance(changelog, list) and changelog
+                    else "Draft updated based on your feedback."
+                )
+                reply = f"{reply}\n\n{change_note}"
+                self._set_status("Draft updated. Add more feedback or say proceed.", level="done")
+                self._render_all()
+            else:
+                fail_msg = str(revise_result.get("message", "Draft revision failed."))
+                reply = f"{reply}\n\nI could not apply feedback: {fail_msg}"
+                self._set_status("Draft feedback iteration failed.", level="error")
+        elif action == "revise_draft":
+            reply = (
+                f"{reply}\n\nI can apply draft feedback only after Draft is completed and before Critique starts."
+            )
         self._post_chat_message(
             ChatMessage(
                 msg_id=str(uuid.uuid4()),

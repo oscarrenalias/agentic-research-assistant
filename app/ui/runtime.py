@@ -4,7 +4,8 @@ import asyncio
 import uuid
 from typing import TYPE_CHECKING
 
-from textual.widgets import DataTable, RichLog, Static
+from rich.markdown import Markdown
+from textual.widgets import RichLog, Static
 
 from app.domain.models import (
     REQUIRED_APPROVAL_STAGES,
@@ -25,29 +26,28 @@ if TYPE_CHECKING:
 def restore_logs(app: AgenticTUI) -> None:
     if not app.state:
         return
-    events = app.query_one("#event-log", RichLog)
-    for entry in app.state.events:
-        events.write(f"[{entry.timestamp}] {entry.message}")
     for message in app.state.messages:
         app._write_chat_renderable(message)
-    app._render_tasks()
+    app._render_all()
 
 
 async def initialize_run_async(app: AgenticTUI) -> None:
-    event_log = app.query_one("#event-log", RichLog)
     if app.repo is None:
-        event_log.write("[error]Repository is not initialized[/error]")
+        app._log_event("Repository is not initialized.")
         app._set_status("Initialization failed.", level="error")
         return
 
     if app.resume_run_id:
         loaded = app.repo.load_run(app.resume_run_id)
         if loaded is None:
-            event_log.write(f"[error]Run not found in DB: {app.resume_run_id}[/error]")
+            app._log_event(f"Run not found in DB: {app.resume_run_id}")
             app._render_summary(error=f"Run not found: {app.resume_run_id}")
             app._set_status("Run not found.", level="error")
             return
         app.state = loaded
+        for stage in REQUIRED_APPROVAL_STAGES:
+            if stage not in app.state.approvals:
+                app.state.approvals[stage] = False
         package_payload = loaded.artifacts.get("normalized_task_package")
         if isinstance(package_payload, dict):
             app.package = NormalizedTaskPackage.from_dict(package_payload)
@@ -63,7 +63,7 @@ async def initialize_run_async(app: AgenticTUI) -> None:
     try:
         app.package = build_normalized_task(app.input_path)
     except Exception as exc:  # noqa: BLE001
-        event_log.write(f"[error]Failed to initialize run:[/error] {exc}")
+        app._log_event(f"Failed to initialize run: {exc}")
         app._render_summary(error=str(exc))
         app._set_status("Initialization failed.", level="error")
         return
@@ -304,7 +304,54 @@ def log_event(app: AgenticTUI, message: str) -> None:
         app.state.events.append(EventEntry(timestamp=timestamp, message=message))
         if app.repo is not None:
             app.repo.add_event(app.state.run_id, message=message, timestamp=timestamp)
-    app.query_one("#event-log", RichLog).write(message)
+
+
+def _content_workspace_markdown(app: AgenticTUI, *, error: str | None = None) -> str:
+    if error:
+        return f"## Initialization Error\n\n{error}"
+    if not app.state:
+        return "## Content Workspace\n\nRun not initialized."
+
+    stage = app._next_stage() or "Done"
+    artifacts = app.state.artifacts
+    final_payload = artifacts.get("final_post", {})
+    revised_payload = artifacts.get("revised_draft", {})
+    draft_payload = artifacts.get("first_draft", "")
+    outline_payload = artifacts.get("approved_outline", {})
+
+    if isinstance(final_payload, dict):
+        post_text = str(final_payload.get("post_text", "")).strip()
+        if post_text:
+            return f"## Final Post\n\n_Showing artifact: `final_post`_\n\n{post_text}"
+
+    if isinstance(revised_payload, dict):
+        revised_text = str(revised_payload.get("revised_draft", "")).strip()
+        if revised_text:
+            return f"## Revised Draft\n\n_Showing artifact: `revised_draft`_\n\n{revised_text}"
+
+    draft_text = str(draft_payload).strip()
+    if draft_text:
+        return f"## Draft\n\n_Showing artifact: `first_draft`_\n\n{draft_text}"
+
+    if isinstance(outline_payload, dict) and outline_payload:
+        hook = str(outline_payload.get("hook", "")).strip() or "n/a"
+        sections = outline_payload.get("sections", [])
+        section_lines = "\n".join(
+            [f"- {str(item)}" for item in sections[:12]]
+        ) if isinstance(sections, list) and sections else "- n/a"
+        return (
+            "## Outline\n\n"
+            "_Showing artifact: `approved_outline`_\n\n"
+            f"**Hook**: {hook}\n\n"
+            "**Sections**\n"
+            f"{section_lines}"
+        )
+
+    return (
+        "## Content Workspace\n\n"
+        f"Current next stage: `{stage}`.\n\n"
+        "Content will appear here once Outline/Draft artifacts are produced."
+    )
 
 
 def persist_artifact(app: AgenticTUI, name: str, value: object) -> None:
@@ -312,62 +359,27 @@ def persist_artifact(app: AgenticTUI, name: str, value: object) -> None:
         return
     app.state.artifacts[name] = value
     app.repo.upsert_artifact(app.state.run_id, name, value)
+    # Keep the top content workspace in sync with artifact writes.
+    app._render_summary()
 
 
 def render_summary(app: AgenticTUI, error: str | None = None) -> None:
-    summary = app.query_one("#run-summary", Static)
-    if error:
-        summary.update(f"[b red]Initialization error[/b red]\n{error}")
-        return
-    if not app.state:
-        summary.update("Run not initialized")
-        return
-
-    next_stage_name = app._next_stage() or "Done"
-    ingest_approval = "approved" if app.state.approvals.get("Ingest") else "pending"
-    final_approval = "approved" if app.state.approvals.get("Final") else "pending"
-    title = app.package.title if app.package else "n/a"
-
-    summary.update(
-        "\n".join(
-            [
-                f"[b]Run ID:[/b] {app.state.run_id}",
-                f"[b]Input:[/b] {app.state.input_path}",
-                f"[b]Title:[/b] {title}",
-                f"[b]Next Stage:[/b] {next_stage_name}",
-                f"[b]Ingest Approval:[/b] {ingest_approval}",
-                f"[b]Final Approval:[/b] {final_approval}",
-            ]
-        )
-    )
+    content_view = app.query_one("#content-view", RichLog)
+    content_view.clear()
+    content_view.write(Markdown(_content_workspace_markdown(app, error=error)))
 
 
 def render_stages(app: AgenticTUI) -> None:
-    stages_table = app.query_one("#stages", DataTable)
-    stages_table.clear(columns=False)
-    if not app.state:
-        return
-
-    for stage in STAGES:
-        approval = "required" if stage in REQUIRED_APPROVAL_STAGES else "-"
-        if stage in app.state.approvals:
-            approval = "approved" if app.state.approvals[stage] else "pending"
-        stages_table.add_row(stage, app.state.stage_status.get(stage, "not_started"), approval)
+    return
 
 
 def render_all(app: AgenticTUI) -> None:
     app._render_summary()
-    app._render_stages()
-    app._render_tasks()
+    return
 
 
 def render_tasks(app: AgenticTUI) -> None:
-    tasks_table = app.query_one("#tasks", DataTable)
-    tasks_table.clear(columns=False)
-    if not app.state:
-        return
-    for task in app.state.tasks[-30:]:
-        tasks_table.add_row(task.task_id[:8], task.owner, task.stage, task.status)
+    return
 
 
 def start_stage(app: AgenticTUI, stage: str) -> bool:
@@ -382,10 +394,75 @@ def start_stage(app: AgenticTUI, stage: str) -> bool:
 
     if stage == "Research" and not app.state.approvals.get("Ingest", False):
         app._log_event("Cannot start Research: Ingest approval is pending.")
+        app._post_chat_message(
+            ChatMessage(
+                msg_id=str(uuid.uuid4()),
+                from_agent="coordinator",
+                to_agent="user",
+                message_type="question",
+                stage="Ingest",
+                priority="high",
+                timestamp=now_iso(),
+                content="Ingest approval is still pending. Approve the ingest plan or request changes.",
+            )
+        )
+        app._render_all()
+        return False
+
+    if stage == "Critique" and not app.state.approvals.get("Draft", False):
+        app._log_event("Cannot start Critique: Draft approval is pending.")
+        app._post_chat_message(
+            ChatMessage(
+                msg_id=str(uuid.uuid4()),
+                from_agent="coordinator",
+                to_agent="user",
+                message_type="question",
+                stage="Draft",
+                priority="high",
+                timestamp=now_iso(),
+                content=(
+                    "Draft approval is pending. Share feedback to iterate the draft, or approve to move to Critique."
+                ),
+            )
+        )
+        app._render_all()
+        return False
+
+    if stage == "Draft" and not app.state.approvals.get("Outline", False):
+        app._log_event("Cannot start Draft: Outline approval is pending.")
+        app._post_chat_message(
+            ChatMessage(
+                msg_id=str(uuid.uuid4()),
+                from_agent="coordinator",
+                to_agent="user",
+                message_type="question",
+                stage="Outline",
+                priority="high",
+                timestamp=now_iso(),
+                content=(
+                    "Outline approval is pending. Share feedback to iterate the outline, "
+                    "or approve to move to Draft."
+                ),
+            )
+        )
+        app._render_all()
         return False
 
     if stage == "Final" and not app.state.approvals.get("Final", False):
         app._log_event("Cannot start Final: Final approval is pending.")
+        app._post_chat_message(
+            ChatMessage(
+                msg_id=str(uuid.uuid4()),
+                from_agent="coordinator",
+                to_agent="user",
+                message_type="question",
+                stage="Final",
+                priority="high",
+                timestamp=now_iso(),
+                content="Final approval is pending. Approve when you are ready to finalize.",
+            )
+        )
+        app._render_all()
         return False
     if stage == "Final":
         critique_payload = app.state.artifacts.get("critique_feedback", {})

@@ -178,7 +178,6 @@ def revise_stage_output(app: AgenticTUI) -> dict[str, object]:
     if not changelog:
         changelog = ["No revision changes required; critique already passed."]
 
-    app._persist_artifact("critique_feedback", current_critique)
     return {
         "revised_draft": current_draft,
         "changelog": changelog,

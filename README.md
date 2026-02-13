@@ -30,6 +30,8 @@ Console-first interactive app (TUI) for orchestrating a multi-agent content work
 - Research stage now fans out into parallel research subtasks; progress appears in the Task Ledger panel.
 - Before Ingest approval, natural-language input is treated as coordinator feedback and triggers plan revision.
 - Before Ingest approval, coordinator also uses inference to classify your intent (`approve` vs `iterate`) from natural language.
+- After Outline completion, approval is required before Draft, and natural-language feedback triggers coordinator-led outline iteration.
+- During outline iteration, coordinator checks evidence sufficiency and can run targeted supplemental research or a full Research refresh before regenerating the outline.
 - Coordinator plan now includes an explicit execution strategy and priority rationale, visible in chat.
 - Chat messages support markdown rendering for lightweight formatting.
 

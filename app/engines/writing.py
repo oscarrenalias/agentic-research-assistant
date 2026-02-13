@@ -9,6 +9,7 @@ class WritingEngine:
     def __init__(self) -> None:
         self.enabled = False
         self._outline_chain = None
+        self._outline_revise_chain = None
         self._draft_chain = None
         self._revise_chain = None
         self._init_error: str | None = None
@@ -63,6 +64,28 @@ class WritingEngine:
                     ),
                 ]
             )
+            outline_revise_prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        (
+                            "You are a writing planner. Return ONLY compact JSON with keys: "
+                            "hook (string), sections (array of strings), argument_flow (array of strings), "
+                            "evidence_map (array of objects with keys: section, source_ids), changelog (array of strings)."
+                        ),
+                    ),
+                    (
+                        "human",
+                        (
+                            "Objective: {objective}\nAudience: {audience}\nTone: {tone}\n"
+                            "Current outline JSON: {outline_json}\n"
+                            "Evidence claims JSON: {claims_json}\n"
+                            "User feedback: {feedback}\n"
+                            "Update the outline using feedback while keeping structure evidence-grounded."
+                        ),
+                    ),
+                ]
+            )
             revise_prompt = ChatPromptTemplate.from_messages(
                 [
                     (
@@ -86,6 +109,7 @@ class WritingEngine:
             )
             llm = ChatOpenAI(model=model, temperature=0.2)
             self._outline_chain = outline_prompt | llm | StrOutputParser()
+            self._outline_revise_chain = outline_revise_prompt | llm | StrOutputParser()
             self._draft_chain = draft_prompt | llm | StrOutputParser()
             self._revise_chain = revise_prompt | llm | StrOutputParser()
             self.enabled = True
@@ -200,6 +224,49 @@ class WritingEngine:
         except Exception:
             return self._fallback_draft(objective, claims)
 
+    def revise_outline(
+        self,
+        *,
+        objective: str,
+        audience: str,
+        tone: str,
+        outline: dict[str, object],
+        claims: list[dict[str, object]],
+        feedback: str,
+    ) -> dict[str, object]:
+        if not self.enabled or self._outline_revise_chain is None:
+            fallback = dict(outline) if isinstance(outline, dict) else self._fallback_outline(claims)
+            fallback.setdefault("changelog", [])
+            changelog = fallback.get("changelog", [])
+            if isinstance(changelog, list):
+                changelog.append("Captured user outline feedback (fallback mode).")
+            else:
+                fallback["changelog"] = ["Captured user outline feedback (fallback mode)."]
+            return fallback
+        try:
+            raw = self._outline_revise_chain.invoke(
+                {
+                    "objective": objective,
+                    "audience": audience,
+                    "tone": tone,
+                    "outline_json": json.dumps(outline, ensure_ascii=True),
+                    "claims_json": json.dumps(claims, ensure_ascii=True),
+                    "feedback": feedback,
+                }
+            )
+            parsed = self._parse_llm_json(raw)
+            return {
+                "hook": str(parsed.get("hook", "Why this topic matters now.")),
+                "sections": [str(x) for x in parsed.get("sections", [])],
+                "argument_flow": [str(x) for x in parsed.get("argument_flow", [])],
+                "evidence_map": parsed.get("evidence_map", []),
+                "changelog": [str(x) for x in parsed.get("changelog", [])],
+            }
+        except Exception:
+            fallback = dict(outline) if isinstance(outline, dict) else self._fallback_outline(claims)
+            fallback["changelog"] = ["Outline revision inference failed; keeping current outline."]
+            return fallback
+
     def revise_draft(
         self,
         *,
@@ -232,5 +299,4 @@ class WritingEngine:
             }
         except Exception:
             return self._fallback_revision(draft)
-
 

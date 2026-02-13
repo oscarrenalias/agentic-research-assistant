@@ -4,7 +4,7 @@ import html
 import re
 import urllib.error
 import urllib.request
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 from app.domain.models import now_iso
 
@@ -45,9 +45,56 @@ def _extract_html_text(raw_html: str) -> tuple[str, str, str]:
     return title, published_at, text
 
 
+def _extract_search_result_url(href: str) -> str:
+    value = href.strip()
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.scheme in {"http", "https"} and parsed.netloc and "duckduckgo.com" not in parsed.netloc:
+        return value
+    if "duckduckgo.com/l/" in value:
+        qs = parse_qs(parsed.query)
+        candidate = unquote(str((qs.get("uddg") or [""])[0]))
+        candidate_parsed = urlparse(candidate)
+        if candidate_parsed.scheme in {"http", "https"} and candidate_parsed.netloc:
+            return candidate
+    return ""
+
+
+def resolve_source_url(source_ref: str, *, timeout_s: float = 8.0) -> str:
+    # If source_ref is already a URL, keep it unchanged.
+    direct = maybe_url(source_ref)
+    if direct:
+        return direct
+
+    query = quote_plus(source_ref.strip())
+    if not query:
+        return ""
+    search_url = f"https://duckduckgo.com/html/?q={query}"
+    try:
+        req = urllib.request.Request(
+            search_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (compatible; AgenticTasksResearch/0.1; +https://example.local)"
+                )
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as response:
+            raw_html = response.read(200_000).decode("utf-8", errors="replace")
+        links = re.findall(r'href=["\']([^"\']+)["\']', raw_html, flags=re.IGNORECASE)
+        for href in links:
+            candidate = _extract_search_result_url(href)
+            if candidate:
+                return candidate
+    except (TimeoutError, urllib.error.URLError, ValueError):
+        return ""
+    return ""
+
+
 def fetch_source_material(source_ref: str, *, timeout_s: float = 8.0) -> dict[str, str]:
     retrieved_at = now_iso()
-    url = maybe_url(source_ref)
+    url = maybe_url(source_ref) or resolve_source_url(source_ref, timeout_s=timeout_s)
     if not url:
         return {
             "source_ref": source_ref,

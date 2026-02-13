@@ -71,6 +71,9 @@ def format_help_markdown() -> str:
         "- `/help`: Show available commands.\n"
         "- `/plan`: Show the latest coordinator plan.\n"
         "- `/run`: Show run summary and approval/checkpoint state.\n"
+        "- `/stages`: Show status of all stages.\n"
+        "- `/events`: Show run events log.\n"
+        "- `/ledger`: Show task ledger snapshot.\n"
         "- `/sources`: Show current evidence sources.\n"
         "- `/agents`: List active agents and aggregate task status counts.\n"
         "- `/inbox <agent_id>`: Show a filtered inbox from shared chat.\n"
@@ -126,6 +129,21 @@ def command_run_summary(app: AgenticTUI) -> str:
     )
 
 
+def command_stages(app: AgenticTUI) -> str:
+    if not app.state:
+        return "No active run."
+
+    lines = ["## Stages", "| Stage | Status | Approval |", "|---|---|---|"]
+    for stage in STAGES:
+        status = str(app.state.stage_status.get(stage, "not_started"))
+        if stage in REQUIRED_APPROVAL_STAGES:
+            approval = "approved" if app.state.approvals.get(stage, False) else "pending"
+        else:
+            approval = "-"
+        lines.append(f"| `{stage}` | `{status}` | `{approval}` |")
+    return "\n".join(lines)
+
+
 def command_sources(app: AgenticTUI) -> str:
     if not app.state:
         return "No active run."
@@ -152,29 +170,157 @@ def command_sources(app: AgenticTUI) -> str:
     return "\n".join(lines)
 
 
+def command_events(app: AgenticTUI) -> str:
+    if not app.state:
+        return "No active run."
+    if not app.state.events:
+        return "No events recorded yet."
+
+    lines = ["## Events", f"- Total events: `{len(app.state.events)}`", ""]
+    for entry in app.state.events[-200:]:
+        lines.append(f"- `{entry.timestamp}` {entry.message}")
+    return "\n".join(lines)
+
+
+def command_ledger(app: AgenticTUI) -> str:
+    if not app.state:
+        return "No active run."
+    if not app.state.tasks:
+        return "No tasks have been created yet."
+
+    lines = [
+        "## Task Ledger",
+        "| Task ID | Owner | Stage | Status | Started | Completed |",
+        "|---|---|---|---|---|---|",
+    ]
+    for task in app.state.tasks[-200:]:
+        started = task.started_at or "-"
+        completed = task.completed_at or "-"
+        lines.append(
+            f"| `{task.task_id[:8]}` | `{task.owner}` | `{task.stage}` | `{task.status}` | `{started}` | `{completed}` |"
+        )
+    return "\n".join(lines)
+
+
 def build_runtime_context(app: AgenticTUI) -> dict[str, Any]:
     if not app.state:
         return {"next_stage": "unknown"}
 
     next_stage = app._next_stage() or "Done"
     pending_approvals = [stage for stage, approved in app.state.approvals.items() if not approved]
-    recent_tasks = app.state.tasks[-20:]
     task_counts: dict[str, int] = {}
     owner_counts: dict[str, int] = {}
-    for task in recent_tasks:
+    for task in app.state.tasks:
         task_counts[task.status] = task_counts.get(task.status, 0) + 1
         owner_counts[task.owner] = owner_counts.get(task.owner, 0) + 1
+
+    artifacts = app.state.artifacts
+    stage_outputs: dict[str, str] = {}
+
+    outline = artifacts.get("approved_outline", {})
+    if isinstance(outline, dict) and outline:
+        hook = str(outline.get("hook", "")).strip()
+        sections = outline.get("sections", [])
+        section_list = [str(x) for x in sections[:8]] if isinstance(sections, list) else []
+        stage_outputs["Outline"] = (
+            f"hook={hook or 'n/a'}; sections={', '.join(section_list) if section_list else 'n/a'}"
+        )
+
+    draft = artifacts.get("first_draft", "")
+    draft_text = str(draft).strip()
+    if draft_text:
+        preview = " ".join(draft_text.split())[:280]
+        stage_outputs["Draft"] = f"chars={len(draft_text)}; preview={preview}"
+
+    critique = artifacts.get("critique_feedback", {})
+    if isinstance(critique, dict) and critique:
+        stage_outputs["Critique"] = (
+            f"pass={bool(critique.get('pass', False))}; "
+            f"total_score={int(critique.get('total_score', 0))}; "
+            f"issues={len(critique.get('issues', [])) if isinstance(critique.get('issues'), list) else 0}"
+        )
+
+    revised = artifacts.get("revised_draft", {})
+    revised_text = ""
+    if isinstance(revised, dict):
+        revised_text = str(revised.get("revised_draft", "")).strip()
+    if revised_text:
+        stage_outputs["Revise"] = (
+            f"chars={len(revised_text)}; "
+            f"passes_quality_gate={bool(revised.get('passes_quality_gate', False))}; "
+            f"revision_attempts={int(revised.get('revision_attempts', 0))}"
+        )
+
+    final_post = artifacts.get("final_post", {})
+    if isinstance(final_post, dict) and final_post:
+        post_text = str(final_post.get("post_text", "")).strip()
+        refs = final_post.get("references", [])
+        ref_count = len(refs) if isinstance(refs, list) else 0
+        stage_outputs["Final"] = f"post_chars={len(post_text)}; references={ref_count}"
+
+    evidence_pack = artifacts.get("evidence_pack", {})
+    if isinstance(evidence_pack, dict) and evidence_pack:
+        claims = evidence_pack.get("claims", [])
+        sources = evidence_pack.get("sources", [])
+        claim_count = len(claims) if isinstance(claims, list) else 0
+        source_count = len(sources) if isinstance(sources, list) else 0
+        stage_outputs["Research"] = f"claims={claim_count}; sources={source_count}"
+
+    recent_agent_messages: list[dict[str, str]] = []
+    for message in app.state.messages:
+        if message.to_agent == "broadcast":
+            continue
+        if message.from_agent == "user" or message.to_agent == "user":
+            continue
+        recent_agent_messages.append(
+            {
+                "from": message.from_agent,
+                "to": message.to_agent,
+                "stage": message.stage,
+                "type": message.message_type,
+                "content": " ".join((message.content or "").split())[:220],
+            }
+        )
+
+    all_tasks = [
+        {
+            "task_id": task.task_id,
+            "run_id": task.run_id,
+            "stage": task.stage,
+            "owner": task.owner,
+            "status": task.status,
+            "input_ref": task.input_ref,
+            "output": task.output,
+            "error": task.error,
+            "created_at": task.created_at,
+            "started_at": task.started_at,
+            "completed_at": task.completed_at,
+        }
+        for task in app.state.tasks
+    ]
+    all_messages = [message.to_dict() for message in app.state.messages]
+    all_events = [{"timestamp": entry.timestamp, "message": entry.message} for entry in app.state.events]
+    package_payload = app.package.to_dict() if app.package else {}
+    coordinator_plan_payload = app.coordinator_plan if isinstance(app.coordinator_plan, dict) else {}
 
     return {
         "run_id": app.state.run_id,
         "input_path": app.state.input_path,
+        "normalized_task_package": package_payload,
+        "coordinator_plan": coordinator_plan_payload,
+        "artifacts": dict(app.state.artifacts),
         "stage_status": dict(app.state.stage_status),
         "approvals": dict(app.state.approvals),
         "pending_approvals": pending_approvals,
         "next_stage": next_stage,
-        "task_status_counts_recent": task_counts,
-        "active_agents_recent": owner_counts,
-        "last_events": [entry.message for entry in app.state.events[-8:]],
+        "task_status_counts": task_counts,
+        "active_agents": owner_counts,
+        "stage_outputs": stage_outputs,
+        "recent_agent_messages": recent_agent_messages,
+        "tasks": all_tasks,
+        "messages": all_messages,
+        "events": all_events,
+        "last_events": [entry.message for entry in app.state.events],
         "objective": (app.package.objective if app.package else ""),
     }
 
@@ -320,10 +466,6 @@ def is_internal_message(message: ChatMessage) -> bool:
     return (
         message.to_agent == "broadcast"
         and message.message_type == "status"
-    ) or (
-        message.from_agent == "coordinator"
-        and message.to_agent != "user"
-        and message.message_type in {"status", "task"}
     )
 
 

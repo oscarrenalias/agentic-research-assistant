@@ -28,6 +28,18 @@ async def handle_slash_command(app: AgenticTUI, text: str) -> bool:
         app._post_coordinator_markdown(app._command_run_summary())
         return True
 
+    if cmd == "/stages":
+        app._post_coordinator_markdown(app._command_stages())
+        return True
+
+    if cmd == "/events":
+        app._post_coordinator_markdown(app._command_events())
+        return True
+
+    if cmd == "/ledger":
+        app._post_coordinator_markdown(app._command_ledger())
+        return True
+
     if cmd == "/sources":
         app._post_coordinator_markdown(app._command_sources())
         return True
@@ -103,6 +115,21 @@ async def handle_slash_command(app: AgenticTUI, text: str) -> bool:
             app._approve_ingest("Plan approved. Continue.", auto_advance=True)
             await app.action_advance_stage()
             return True
+        if app._outline_gate_pending():
+            app.action_approve_gate()
+            if app.state and app.state.approvals.get("Outline", False):
+                await app.action_advance_stage()
+            return True
+        if (
+            app.state
+            and app.state.stage_status.get("Draft") == "completed"
+            and app.state.stage_status.get("Critique") == "not_started"
+            and not app.state.approvals.get("Draft", False)
+        ):
+            app.action_approve_gate()
+            if app.state.approvals.get("Draft", False):
+                await app.action_advance_stage()
+            return True
         if app.state and app.state.stage_status.get("Revise") == "completed" and not app.state.approvals.get("Final", False):
             app.action_approve_gate()
             if app.state.approvals.get("Final", False):
@@ -115,6 +142,20 @@ async def handle_slash_command(app: AgenticTUI, text: str) -> bool:
         reason = arg.strip() or "Rejected by user. Please revise."
         if app.state and not app.state.approvals.get("Ingest", False):
             await app._iterate_ingest_with_feedback(reason)
+            return True
+        if app._outline_gate_pending():
+            await app._iterate_outline_with_feedback(reason)
+            return True
+        if (
+            app.state
+            and app.state.stage_status.get("Draft") == "completed"
+            and app.state.stage_status.get("Critique") == "not_started"
+            and not app.state.approvals.get("Draft", False)
+        ):
+            app._post_coordinator_markdown(
+                "Draft approval remains pending. Share draft feedback in chat (e.g., shorter/longer/expand topic), "
+                "and I will revise before moving to Critique."
+            )
             return True
         if app.state and app.state.stage_status.get("Revise") == "completed" and not app.state.approvals.get("Final", False):
             app._post_chat_message(

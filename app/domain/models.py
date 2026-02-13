@@ -13,7 +13,7 @@ CITATION_MARKER_RE = re.compile(r"\[S\d+\]")
 PUBLISHED_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}([T\s].*)?$")
 
 STAGES = ["Ingest", "Research", "Outline", "Draft", "Critique", "Revise", "Final"]
-REQUIRED_APPROVAL_STAGES = {"Ingest", "Final"}
+REQUIRED_APPROVAL_STAGES = {"Ingest", "Outline", "Draft", "Final"}
 MESSAGE_TYPES = {"task", "question", "result", "review", "decision", "status"}
 PRIORITY_LEVELS = {"low", "normal", "high"}
 TASK_RELATED_MESSAGE_TYPES = {"task", "result", "review"}
