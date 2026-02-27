@@ -12,6 +12,12 @@ from app.services.sources import fetch_source_material, infer_source_tier, maybe
 if TYPE_CHECKING:
     from app.tui import AgenticTUI
 
+MAX_ANALYST_TASKS = 25
+
+
+def _normalize_source_key(value: str) -> str:
+    return " ".join((value or "").strip().split())
+
 
 async def run_instruction_review_loop(app: AgenticTUI, tasks: list[TaskRecord]) -> None:
     if not tasks:
@@ -141,6 +147,15 @@ async def execute_research_parallel(app: AgenticTUI) -> dict[str, object]:
         candidates = list(app.package.source_candidates)
     if not candidates:
         candidates = ["No explicit source provided"]
+    deduped_candidates: list[str] = []
+    seen_candidate_keys: set[str] = set()
+    for source in candidates:
+        key = _normalize_source_key(source)
+        if not key or key in seen_candidate_keys:
+            continue
+        seen_candidate_keys.add(key)
+        deduped_candidates.append(source.strip())
+    candidates = deduped_candidates or ["No explicit source provided"]
 
     plan_tasks = app.coordinator_plan.get("analyst_tasks", [])
     inferred_tasks: list[dict[str, str]] = []
@@ -158,11 +173,45 @@ async def execute_research_parallel(app: AgenticTUI) -> dict[str, object]:
                 }
             )
 
+    # Guarantee coverage: every provided source must be analyzed at least once.
+    if len(candidates) > MAX_ANALYST_TASKS:
+        raise ValueError(
+            f"Source coverage requirement violated: {len(candidates)} sources provided, "
+            f"but MAX_ANALYST_TASKS={MAX_ANALYST_TASKS}."
+        )
+
+    for i, task in enumerate(inferred_tasks):
+        if _normalize_source_key(task.get("source_hint", "")):
+            continue
+        task["source_hint"] = candidates[i % len(candidates)]
+
+    covered_keys = {_normalize_source_key(str(task.get("source_hint", ""))) for task in inferred_tasks}
+    covered_keys.discard("")
+    next_agent_idx = len(inferred_tasks) + 1
+    for source in candidates:
+        key = _normalize_source_key(source)
+        if key in covered_keys:
+            continue
+        inferred_tasks.append(
+            {
+                "agent_id": f"research_agent_{next_agent_idx}",
+                "objective": "Extract 4-5 evidence-backed claims relevant to objective.",
+                "source_hint": source,
+                "instructions": (
+                    "Analyze this assigned source directly. "
+                    "Provide 4-5 claims with evidence notes, caveats, and confidence."
+                ),
+                "priority": "high",
+            }
+        )
+        next_agent_idx += 1
+        covered_keys.add(key)
+
     if not inferred_tasks:
-        for i, source in enumerate(candidates[: min(6, len(candidates))]):
+        for i, source in enumerate(candidates[: min(MAX_ANALYST_TASKS, len(candidates))]):
             inferred_tasks.append(
                 {
-                    "agent_id": f"research_agent_{(i % 3) + 1}",
+                    "agent_id": f"research_agent_{i+1}",
                     "objective": "Extract 4-5 evidence-backed claims relevant to objective.",
                     "source_hint": source,
                     "instructions": "Provide 4-5 claims with notes and confidence.",
@@ -170,10 +219,10 @@ async def execute_research_parallel(app: AgenticTUI) -> dict[str, object]:
                 }
             )
 
-    capped = inferred_tasks[: min(8, len(inferred_tasks))]
+    capped = inferred_tasks[: min(MAX_ANALYST_TASKS, len(inferred_tasks))]
     tasks: list[TaskRecord] = []
     for i, spec in enumerate(capped):
-        owner = spec["agent_id"] or f"research_agent_{(i % 3) + 1}"
+        owner = spec["agent_id"] or f"research_agent_{i+1}"
         source = spec["source_hint"] or candidates[i % len(candidates)]
         record = TaskRecord(
             task_id=str(uuid.uuid4()),

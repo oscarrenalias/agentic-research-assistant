@@ -17,7 +17,6 @@ from app.domain.models import (
     RunState,
     now_iso,
 )
-from app.services.ingest import build_normalized_task
 
 if TYPE_CHECKING:
     from app.tui import AgenticTUI
@@ -61,7 +60,12 @@ async def initialize_run_async(app: AgenticTUI) -> None:
         return
 
     try:
-        app.package = build_normalized_task(app.input_path)
+        brief_text = app.input_path.read_text(encoding="utf-8")
+        app.package, extracted = await asyncio.to_thread(
+            app.coordinator_engine.infer_brief_package,
+            input_path=str(app.input_path),
+            brief_text=brief_text,
+        )
     except Exception as exc:  # noqa: BLE001
         app._log_event(f"Failed to initialize run: {exc}")
         app._render_summary(error=str(exc))
@@ -76,12 +80,16 @@ async def initialize_run_async(app: AgenticTUI) -> None:
         updated_at=created,
         stage_status={stage: "not_started" for stage in STAGES},
         approvals={stage: False for stage in REQUIRED_APPROVAL_STAGES},
-        artifacts={"user_brief": {"input_path": app.package.input_path}},
+        artifacts={
+            "user_brief": {"input_path": app.package.input_path, "brief_text": brief_text[:40_000]},
+            "brief_extraction": extracted,
+        },
         tasks=[],
     )
 
     app.repo.create_run(app.state)
     app.repo.upsert_artifact(app.state.run_id, "user_brief", app.state.artifacts["user_brief"])
+    app.repo.upsert_artifact(app.state.run_id, "brief_extraction", app.state.artifacts["brief_extraction"])
 
     app._start_stage("Ingest")
     app._complete_stage("Ingest", app.package.to_dict())
@@ -108,10 +116,54 @@ async def generate_coordinator_plan_async(app: AgenticTUI) -> None:
 def post_ingest_summary_and_approval_request(app: AgenticTUI) -> None:
     if not app.package:
         return
+    extraction = {}
+    if app.state:
+        artifact = app.state.artifacts.get("brief_extraction", {})
+        extraction = artifact if isinstance(artifact, dict) else {}
+
+    constraints_preview = "; ".join(app.package.constraints[:4]) if app.package.constraints else "n/a"
+    key_points_preview = "; ".join(app.package.key_points[:6]) if app.package.key_points else "n/a"
+    extraction_lines = (
+        "Inferred brief package:\n"
+        f"- Objective: {app.package.objective[:220]}\n"
+        f"- Audience: {app.package.audience[:180]}\n"
+        f"- Tone: {app.package.tone[:180]}\n"
+        f"- Constraints: {constraints_preview[:260]}\n"
+        f"- Key points: {key_points_preview[:260]}\n"
+        f"- Source candidates: {len(app.package.source_candidates)}"
+    )
+    app._post_chat_message(
+        ChatMessage(
+            msg_id=str(uuid.uuid4()),
+            from_agent="coordinator",
+            to_agent="user",
+            message_type="status",
+            stage="Ingest",
+            priority="normal",
+            timestamp=now_iso(),
+            content=extraction_lines,
+        )
+    )
+
+    extraction_notes = extraction.get("extraction_notes", [])
+    if isinstance(extraction_notes, list) and extraction_notes:
+        notes_text = "Inference notes:\n" + "\n".join([f"- {str(item)}" for item in extraction_notes[:6]])
+        app._post_chat_message(
+            ChatMessage(
+                msg_id=str(uuid.uuid4()),
+                from_agent="coordinator",
+                to_agent="user",
+                message_type="status",
+                stage="Ingest",
+                priority="normal",
+                timestamp=now_iso(),
+                content=notes_text,
+            )
+        )
+
     summary = str(app.coordinator_plan.get("summary_for_user", "")).strip()
     execution_plan = str(app.coordinator_plan.get("execution_plan_for_user", "")).strip()
     if not summary:
-        constraints_preview = "; ".join(app.package.constraints[:2]) if app.package.constraints else "n/a"
         summary = (
             "Ingest summary: "
             f"Objective='{app.package.objective[:160]}', "
@@ -120,9 +172,16 @@ def post_ingest_summary_and_approval_request(app: AgenticTUI) -> None:
             f"Source candidates={len(app.package.source_candidates)}, "
             f"Constraints(sample)='{constraints_preview[:180]}'."
         )
-    approval_question = str(
+    extraction_confirmation = str(
+        extraction.get(
+            "confirmation_question",
+            "Please confirm these extracted brief details before we proceed.",
+        )
+    ).strip()
+    plan_approval = str(
         app.coordinator_plan.get("approval_question", "Please approve this ingest plan so I can start Research.")
-    )
+    ).strip()
+    approval_question = f"{extraction_confirmation}\n\n{plan_approval}"
     if not execution_plan:
         execution_plan = (
             "Execution plan: run parallel research agents across key topics, prioritize disputed/controversial "

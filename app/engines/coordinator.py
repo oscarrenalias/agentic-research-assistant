@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
 from typing import Any
 
-from app.domain.models import NormalizedTaskPackage
+from app.domain.models import NormalizedTaskPackage, URL_RE, now_iso
+
+MAX_ANALYST_TASKS = 25
 
 
 class CoordinatorEngine:
@@ -13,6 +16,7 @@ class CoordinatorEngine:
     def __init__(self) -> None:
         self.enabled = False
         self._chain = None
+        self._brief_extract_chain = None
         self._feedback_chain = None
         self._intent_chain = None
         self._gate_intent_chain = None
@@ -50,6 +54,7 @@ class CoordinatorEngine:
                             "priority_rationale (array of strings), "
                             "analyst_tasks (array of objects with keys: agent_id, objective, source_hint, instructions, priority), "
                             "notes (array of strings). "
+                            "Every provided source candidate must appear in analyst_tasks.source_hint at least once. "
                             "Do not return markdown."
                         ),
                     ),
@@ -63,7 +68,34 @@ class CoordinatorEngine:
                             "Constraints: {constraints}\n"
                             "Key points: {key_points}\n"
                             "Source candidates: {source_candidates}\n"
-                            "Create an ingest understanding and research fan-out plan."
+                            "Create an ingest understanding and research fan-out plan. "
+                            "Do not omit any source candidate from analyst task assignments."
+                        ),
+                    ),
+                ]
+            )
+            brief_extract_prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        (
+                            "You are the coordinator in a multi-agent research workflow. "
+                            "Infer a normalized brief package from unstructured user input. "
+                            "Return ONLY JSON with keys: "
+                            "title (string), objective (string), audience (string), tone (string), "
+                            "constraints (array of strings), key_points (array of strings), "
+                            "source_candidates (array of strings), extraction_notes (array of strings), "
+                            "confirmation_question (string). "
+                            "Infer missing details conservatively from context. "
+                            "Do not return markdown."
+                        ),
+                    ),
+                    (
+                        "human",
+                        (
+                            "Input path: {input_path}\n"
+                            "User brief text:\n{brief_text}\n"
+                            "Extract a practical package for research planning."
                         ),
                     ),
                 ]
@@ -224,6 +256,7 @@ class CoordinatorEngine:
             )
             llm = ChatOpenAI(model=model, temperature=0)
             self._chain = prompt | llm | StrOutputParser()
+            self._brief_extract_chain = brief_extract_prompt | llm | StrOutputParser()
             self._feedback_chain = feedback_prompt | llm | StrOutputParser()
             self._intent_chain = intent_prompt | llm | StrOutputParser()
             self._gate_intent_chain = gate_intent_prompt | llm | StrOutputParser()
@@ -367,7 +400,7 @@ class CoordinatorEngine:
     @staticmethod
     def _fallback_plan(package: NormalizedTaskPackage, note: str) -> dict[str, Any]:
         key_topics = package.key_points[:5] if package.key_points else [package.objective[:100]]
-        task_count = max(2, min(4, len(package.source_candidates) or 2))
+        task_count = max(2, min(MAX_ANALYST_TASKS, len(package.source_candidates) or 2))
         analyst_tasks: list[dict[str, str]] = []
         for i in range(task_count):
             source_hint = package.source_candidates[i] if i < len(package.source_candidates) else package.objective
@@ -447,6 +480,89 @@ class CoordinatorEngine:
             return self._normalize_plan_dict(parsed)
         except Exception:  # noqa: BLE001
             return self._fallback_plan(package, "coordinator_call_failed_fallback")
+
+    def infer_brief_package(self, *, input_path: str, brief_text: str) -> tuple[NormalizedTaskPackage, dict[str, Any]]:
+        if not self.enabled or self._brief_extract_chain is None:
+            raise ValueError(
+                "Coordinator inference is unavailable. Set OPENAI_API_KEY so the orchestrator can infer brief fields."
+            )
+
+        try:
+            raw = self._brief_extract_chain.invoke(
+                {
+                    "input_path": input_path,
+                    "brief_text": brief_text[:40_000],
+                }
+            )
+            parsed = self._parse_llm_json(raw)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"Brief extraction inference failed: {exc}") from exc
+
+        def _as_list(value: object) -> list[str]:
+            if not isinstance(value, list):
+                return []
+            return [str(x).strip() for x in value if str(x).strip()]
+
+        title = str(parsed.get("title", "")).strip() or None
+        objective = str(parsed.get("objective", "")).strip()
+        audience = str(parsed.get("audience", "")).strip()
+        tone = str(parsed.get("tone", "")).strip()
+        constraints = _as_list(parsed.get("constraints"))
+        key_points = _as_list(parsed.get("key_points"))
+        source_candidates = _as_list(parsed.get("source_candidates"))
+        extraction_notes = _as_list(parsed.get("extraction_notes"))
+        confirmation_question = str(
+            parsed.get(
+                "confirmation_question",
+                "Please confirm these extracted brief details before we proceed with planning.",
+            )
+        ).strip()
+
+        for match in URL_RE.findall(brief_text):
+            if match not in source_candidates:
+                source_candidates.append(match)
+
+        if not objective:
+            objective = "Produce a well-researched article aligned with the provided brief."
+            extraction_notes.append("Objective was inferred using a conservative default.")
+        if not audience:
+            audience = "Business and technology leaders involved in enterprise transformation."
+            extraction_notes.append("Audience was inferred using a conservative default.")
+        if not tone:
+            tone = "Practical, plain-language, evidence-backed."
+            extraction_notes.append("Tone was inferred using a conservative default.")
+        if not constraints:
+            constraints = [
+                "Structure content clearly with sections.",
+                "Use verifiable claims with citations.",
+            ]
+            extraction_notes.append("Constraints were inferred using conservative defaults.")
+
+        package = NormalizedTaskPackage(
+            run_id=str(uuid.uuid4()),
+            created_at=now_iso(),
+            input_path=input_path,
+            objective=objective,
+            audience=audience,
+            tone=tone,
+            constraints=constraints,
+            source_candidates=source_candidates,
+            title=title,
+            key_points=key_points,
+        )
+        extraction_payload = {
+            "title": title or "",
+            "objective": objective,
+            "audience": audience,
+            "tone": tone,
+            "constraints": constraints,
+            "key_points": key_points,
+            "source_candidates": source_candidates,
+            "extraction_notes": extraction_notes,
+            "confirmation_question": confirmation_question
+            or "Please confirm these extracted brief details before we proceed with planning.",
+        }
+        return package, extraction_payload
 
     def revise_plan(
         self,
@@ -691,7 +807,7 @@ class CoordinatorEngine:
                 intent = "revise_outline"
             max_tasks_raw = parsed.get("max_additional_tasks", 3)
             try:
-                max_tasks = max(1, min(8, int(max_tasks_raw)))
+                max_tasks = max(1, min(MAX_ANALYST_TASKS, int(max_tasks_raw)))
             except Exception:  # noqa: BLE001
                 max_tasks = 3
             focus = parsed.get("research_focus", [])

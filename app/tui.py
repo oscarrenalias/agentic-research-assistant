@@ -565,7 +565,7 @@ class AgenticTUI(App[None]):
             max_tasks = int(decision.get("max_additional_tasks", 3)) if isinstance(decision, dict) else 3
         except Exception:  # noqa: BLE001
             max_tasks = 3
-        max_tasks = max(1, min(8, max_tasks))
+        max_tasks = max(1, min(25, max_tasks))
         if intent == "approve":
             self._approve_outline("Outline approved. Proceed to Draft.")
             self._post_chat_message(
@@ -608,7 +608,7 @@ class AgenticTUI(App[None]):
                 source_hint = base_candidates[i % len(base_candidates)] if base_candidates else fallback_source
                 tasks.append(
                     {
-                        "agent_id": f"research_agent_{(i % 3) + 1}",
+                        "agent_id": f"research_agent_{i+1}",
                         "objective": f"Collect evidence for outline revision focus: {focus_item[:160]}",
                         "source_hint": source_hint,
                         "instructions": (

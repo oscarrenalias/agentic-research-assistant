@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import html
+import io
 import re
 import urllib.error
 import urllib.request
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 from app.domain.models import now_iso
+
+try:
+    from pypdf import PdfReader
+except Exception:  # noqa: BLE001
+    PdfReader = None  # type: ignore[assignment]
 
 
 def maybe_url(value: str) -> str | None:
@@ -43,6 +49,30 @@ def _extract_html_text(raw_html: str) -> tuple[str, str, str]:
     no_tags = re.sub(r"<[^>]+>", " ", no_styles)
     text = html.unescape(_clean_text(no_tags))
     return title, published_at, text
+
+
+def _looks_like_pdf(url: str, content_type: str, raw_bytes: bytes) -> bool:
+    lower_url = url.lower()
+    if ".pdf" in lower_url or "application/pdf" in content_type:
+        return True
+    return raw_bytes.startswith(b"%PDF-")
+
+
+def _extract_pdf_text(raw_bytes: bytes) -> tuple[str, str]:
+    if PdfReader is None:
+        return "", ""
+    try:
+        reader = PdfReader(io.BytesIO(raw_bytes))
+        title = _clean_text(str(getattr(reader.metadata, "title", "") or ""))
+        page_text: list[str] = []
+        for page in reader.pages[:80]:
+            extracted = page.extract_text() or ""
+            cleaned = _clean_text(extracted)
+            if cleaned:
+                page_text.append(cleaned)
+        return title, _clean_text(" ".join(page_text))
+    except Exception:  # noqa: BLE001
+        return "", ""
 
 
 def _extract_search_result_url(href: str) -> str:
@@ -119,16 +149,21 @@ def fetch_source_material(source_ref: str, *, timeout_s: float = 8.0) -> dict[st
             },
         )
         with urllib.request.urlopen(req, timeout=timeout_s) as response:
-            raw_bytes = response.read(250_000)
+            raw_bytes = response.read(2_500_000)
             content_type = response.headers.get("Content-Type", "").lower()
-        text = raw_bytes.decode("utf-8", errors="replace")
-
         title = ""
         published_at = ""
-        if "html" in content_type or "<html" in text[:500].lower():
-            title, published_at, extracted = _extract_html_text(text)
+        extracted = ""
+        if _looks_like_pdf(url, content_type, raw_bytes):
+            title, extracted = _extract_pdf_text(raw_bytes)
+            if not extracted:
+                extracted = _clean_text(raw_bytes.decode("latin-1", errors="replace"))
         else:
-            extracted = _clean_text(text)
+            text = raw_bytes.decode("utf-8", errors="replace")
+            if "html" in content_type or "<html" in text[:500].lower():
+                title, published_at, extracted = _extract_html_text(text)
+            else:
+                extracted = _clean_text(text)
 
         if not extracted:
             extracted = _clean_text(source_ref)
