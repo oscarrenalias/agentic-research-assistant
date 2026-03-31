@@ -27,7 +27,7 @@ uv sync
 
 ## Run
 ```bash
-uv run python main.py
+uv run agentic-research
 ```
 
 CLI options:
